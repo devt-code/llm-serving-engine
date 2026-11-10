@@ -1,0 +1,43 @@
+{
+  "engine": "hf-transformers",
+  "timestamp": "2026-11-09T20:11:52",
+  "device": "mps",
+  "dtype": "bfloat16",
+  "machine": "macOS-26.6.2-arm64-arm-64bit",
+  "torch": "2.15.0",
+  "results": [
+    {
+      "batch_size": 1,
+      "prompt_tokens_padded": 23,
+      "max_new_tokens": 128,
+      "prefill_s": 0.0401,
+      "e2e_s": 2.162,
+      "e2e_output_tok_per_s": 59.2,
+      "decode_tok_per_s": 59.85,
+      "per_request_decode_tok_per_s": 59.85,
+      "sample_output": "A CPU cache is a type of memory used to store data and instructions that are frequently accessed by the CPU. It works in a way similar to a temporary storage system, so that the CPU doesn't have to co"
+    },
+    {
+      "batch_size": 8,
+      "prompt_tokens_padded": 28,
+      "max_new_tokens": 128,
+      "prefill_s": 0.133,
+      "e2e_s": 3.9391,
+      "e2e_output_tok_per_s": 259.96,
+      "decode_tok_per_s": 266.94,
+      "per_request_decode_tok_per_s": 33.37,
+      "sample_output": "A CPU cache is a type of memory used to store data and instructions that are frequently accessed by the CPU. It works in a way similar to a temporary storage system, so that the CPU doesn't have to co"
+    },
+    {
+      "batch_size": 32,
+      "prompt_tokens_padded": 28,
+      "max_new_tokens": 128,
+      "prefill_s": 0.4358,
+      "e2e_s": 7.7259,
+      "e2e_output_tok_per_s": 530.17,
+      "decode_tok_per_s": 557.47,
+      "per_request_decode_tok_per_s": 17.42,
+      "sample_output": "A CPU cache is a type of memory used to store data and instructions that are frequently accessed by the CPU. It works in a way similar to a temporary storage system, so that the CPU doesn't have to co"
+    }
+  ]
+}

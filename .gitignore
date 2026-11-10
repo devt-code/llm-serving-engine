@@ -1,0 +1,14 @@
+.venv/
+models/
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+dashboard/dist/
+bench/traces/*.jsonl
+.DS_Store
+
+# Claude Code files (keep out of the repo)
+CLAUDE.md
+CLAUDE.local.md
+.claude/

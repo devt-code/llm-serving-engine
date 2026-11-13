@@ -39,7 +39,7 @@ That's how vLLM works, and it's why Phase 2 is manageable: a "batch" of requests
 becomes one long flat sequence, and only attention needs to know where each request starts and ends.
 
 ## Done when
-- [ ] `pytest` → 43 passed
-- [ ] tokens/s recorded in `bench/results/engine_single.json` and the dev log
+- [x] `pytest` → 43 passed
+- [x] tokens/s recorded in `bench/results/engine_single.json` and the dev log
 - [ ] You can explain: why q/k norm before RoPE, why GQA saves KV memory (8 KV heads vs 16 query heads),
       and why the causal mask needs an offset once a cache exists

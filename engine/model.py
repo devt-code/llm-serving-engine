@@ -1,9 +1,6 @@
 """Qwen3 implemented from scratch in PyTorch.
 
-Phase 1 skeleton. Every `TODO(you)` is yours to implement. The `__init__` methods are done
-because parameter names/shapes must match the checkpoint exactly (see engine/loader.py).
-
-Shape conventions (important — this is the vLLM style and makes Phase 2 much easier):
+Shape conventions (the vLLM style; it makes Phase 2 much easier):
     There is NO batch dimension. A forward pass takes one flat sequence of T tokens.
       input_ids:  [T]            token ids
       positions:  [T]            absolute position of each token (0..T-1 for a fresh prompt,
@@ -16,10 +13,7 @@ Shape conventions (important — this is the vLLM style and makes Phase 2 much e
 Qwen3-0.6B numbers: hidden 1024, 16 q heads, 8 kv heads, head_dim 128 (so q_proj is
 1024 -> 2048, not 1024 -> 1024), MLP 3072, 28 layers, rope_theta 1e6, eps 1e-6.
 
-Run tests for one component at a time, e.g.:
-    pytest tests/test_model.py -k rmsnorm -x
-Order that works well: rmsnorm -> rope -> mlp -> attention -> decoder_layer -> logits
--> kv_cache -> greedy.
+Tests: pytest tests/test_model.py   (or one component: -k rmsnorm, -k rope, -k attention, ...)
 """
 
 import torch
@@ -40,27 +34,32 @@ class RMSNorm(nn.Module):
 
         y = x / sqrt(mean(x^2 over last dim) + eps) * weight
 
-        Precision gotcha: in bf16, compute the normalization in float32, cast back to the
-        input dtype, THEN multiply by weight. The order matters for matching HF exactly.
+        Unlike LayerNorm there is no mean subtraction and no bias: it only rescales each
+        vector to unit root-mean-square, then applies a learned per-dimension gain.
         """
-        raise NotImplementedError("TODO(you): RMSNorm.forward")
+        input_dtype = x.dtype
+        # Squaring bf16 values loses precision fast, so do the statistics in float32.
+        # F.rms_norm without a weight computes exactly  x * rsqrt(mean(x^2) + eps)  as ONE
+        # fused kernel instead of ~5 small ones (pow, mean, add, rsqrt, mul). On a GPU,
+        # decode is dominated by per-kernel launch overhead, so this saves ~5 ms per step.
+        normed = F.rms_norm(x.float(), (x.shape[-1],), eps=self.eps)
+        # Cast back BEFORE multiplying by weight; this is HF's order, and in bf16 the
+        # other order gives slightly different numbers (test_rmsnorm_bf16_order checks it).
+        return self.weight * normed.to(input_dtype)
 
 
 class RotaryEmbedding(nn.Module):
     """Rotary position embeddings (RoPE).
 
-    For each pair of dims i in [0, head_dim/2): inv_freq[i] = theta ** (-2i / head_dim).
-    The angle for position p is p * inv_freq[i].
+    RoPE encodes position by ROTATING q and k vectors instead of adding a position vector.
+    Dims are grouped into head_dim/2 pairs; pair i is rotated by angle  p * inv_freq[i],
+    where p is the token's position and inv_freq[i] = theta ** (-2i / head_dim).
+    Low i -> fast rotation (fine-grained position), high i -> slow (long-range position).
+    Because q·k after rotation depends only on the angle DIFFERENCE, attention scores end
+    up depending on relative position, which is the whole point.
 
-    Convention gotcha: Qwen3 (like Llama) uses the "rotate_half" layout, NOT interleaved
-    pairs. Dim i is paired with dim i + head_dim/2, so cos/sin are [angles, angles]
-    concatenated along the last dim. Pairing (0,1), (2,3)... gives wrong outputs with these
-    weights.
-
-    Tip: precomputing a cos/sin table for all positions up to max_position in __init__
-    (computed in float32) and indexing it with `positions` in forward is the fast approach.
-    Register it with `self.register_buffer(..., persistent=False)` so it moves with
-    `.to(device)`. Note the loader calls `model.to(dtype)`, which casts float buffers too.
+    Layout: Qwen3 uses "rotate_half" pairing, i.e. dim i is paired with dim i + head_dim/2
+    (not adjacent dims). So cos/sin are [angles, angles] concatenated along the last dim.
     """
 
     def __init__(self, head_dim: int, theta: float, max_position: int):
@@ -68,11 +67,26 @@ class RotaryEmbedding(nn.Module):
         self.head_dim = head_dim
         self.theta = theta
         self.max_position = max_position
-        # TODO(you): precompute anything you want here (optional)
+
+        # Precompute a cos/sin table for every position once (in float32 for accuracy),
+        # so forward() is just a table lookup. 40960 x 128 x 2 tables = ~40 MB in fp32.
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))  # [D/2]
+        pos = torch.arange(max_position, dtype=torch.float32)  # [P]
+        angles = torch.outer(pos, inv_freq)  # [P, D/2]
+        angles = torch.cat([angles, angles], dim=-1)  # [P, D] (rotate_half layout)
+        # persistent=False: not part of the checkpoint, but still moves with .to(device)
+        self.register_buffer("cos_cache", angles.cos(), persistent=False)
+        self.register_buffer("sin_cache", angles.sin(), persistent=False)
 
     def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """positions: [T] (long) -> (cos, sin), each [T, head_dim]"""
-        raise NotImplementedError("TODO(you): RotaryEmbedding.forward")
+        return self.cos_cache[positions], self.sin_cache[positions]
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """[a, b] -> [-b, a], where a and b are the two halves of the last dim."""
+    half = x.shape[-1] // 2
+    return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
 
 
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -83,22 +97,28 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     sin: [T, head_dim]
     returns [T, num_heads, head_dim], same dtype as x
 
-    Hint: x * cos + rotate_half(x) * sin, where rotate_half([a, b]) = [-b, a]
-    (a, b are the first and second halves of the last dim). Mind the broadcasting over heads.
+    For each pair (a, b) this computes the 2D rotation
+        a' = a*cos - b*sin
+        b' = b*cos + a*sin
+    written in vector form as  x*cos + rotate_half(x)*sin.
     """
-    raise NotImplementedError("TODO(you): apply_rotary")
+    cos = cos[:, None, :].to(x.dtype)  # [T, 1, D], broadcasts over heads
+    sin = sin[:, None, :].to(x.dtype)
+    return x * cos + rotate_half(x) * sin
 
 
 class KVCache:
     """Simple contiguous KV cache for ONE request (Phase 1). Replaced by the paged cache in Phase 3.
 
-    Preallocate, per layer, a K and a V tensor of shape [max_len, num_key_value_heads, head_dim].
+    Per layer, a K and a V tensor of shape [max_len, num_key_value_heads, head_dim] is
+    preallocated up front. That upfront reservation of max_len slots per request is exactly
+    the memory waste the paged cache fixes later.
 
     Protocol used by the model:
       - During a forward pass over T new tokens, each layer calls
             k_all, v_all = cache.update(layer_idx, k_new, v_new)
-        which writes k_new/v_new ([T, kv_heads, head_dim]) into slots [seq_len, seq_len + T)
-        and returns views of slots [0, seq_len + T) — i.e. all keys/values so far.
+        which writes k_new/v_new into slots [seq_len, seq_len + T) and returns views of
+        slots [0, seq_len + T), i.e. all keys/values so far.
       - After ALL layers have run, the model calls cache.advance(T) once, so seq_len only
         moves forward once per forward pass (not once per layer).
     """
@@ -106,13 +126,21 @@ class KVCache:
     def __init__(self, config: Qwen3Config, max_len: int, device: torch.device, dtype: torch.dtype):
         self.max_len = max_len
         self.seq_len = 0
-        raise NotImplementedError("TODO(you): KVCache.__init__ (allocate per-layer K/V tensors)")
+        shape = (max_len, config.num_key_value_heads, config.head_dim)
+        self.k = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(config.num_hidden_layers)]
+        self.v = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(config.num_hidden_layers)]
 
     def update(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError("TODO(you): KVCache.update")
+        start, end = self.seq_len, self.seq_len + k.shape[0]
+        if end > self.max_len:
+            raise RuntimeError(f"KV cache full: need {end} slots, have {self.max_len}")
+        self.k[layer_idx][start:end] = k
+        self.v[layer_idx][start:end] = v
+        # Slicing returns views (no copy).
+        return self.k[layer_idx][:end], self.v[layer_idx][:end]
 
     def advance(self, num_tokens: int) -> None:
-        raise NotImplementedError("TODO(you): KVCache.advance")
+        self.seq_len += num_tokens
 
 
 class Attention(nn.Module):
@@ -141,22 +169,57 @@ class Attention(nn.Module):
         sin: torch.Tensor,
         kv_cache: KVCache | None = None,
     ) -> torch.Tensor:
-        """x: [T, hidden] -> [T, hidden]
+        """x: [T, hidden] -> [T, hidden]"""
+        T = x.shape[0]
 
-        Steps:
-          1. project to q [T, Hq, D], k [T, Hkv, D], v [T, Hkv, D]
-          2. q_norm(q), k_norm(k)   (per head, over D)
-          3. RoPE on q and k
-          4. if kv_cache: k, v = kv_cache.update(self.layer_idx, k, v)  -> [S, Hkv, D], S >= T
-          5. grouped-query attention: each kv head serves `num_kv_groups` q heads
-          6. causal mask: query i (absolute position S - T + i) may attend to keys 0..S - T + i
-          7. o_proj back to [T, hidden]
+        # 1. Project and split into heads.
+        q = self.q_proj(x).view(T, self.num_heads, self.head_dim)  # [T, 16, 128]
+        k = self.k_proj(x).view(T, self.num_kv_heads, self.head_dim)  # [T, 8, 128]
+        v = self.v_proj(x).view(T, self.num_kv_heads, self.head_dim)  # [T, 8, 128]
 
-        Hint: F.scaled_dot_product_attention expects [heads, seq, dim] (or with a batch dim).
-        Careful: its `is_causal=True` assumes query and key lengths are equal and aligned at
-        position 0. That is wrong when S > T (decode, or prefill with existing cache).
-        """
-        raise NotImplementedError("TODO(you): Attention.forward")
+        # 2. Qwen3's per-head q/k norm. Keeps q·k magnitudes bounded, which stabilizes
+        #    training; at inference we just have to replicate it.
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # 3. Encode positions by rotating q and k.
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
+
+        # 4. Append this step's k/v to the cache and get ALL keys/values so far.
+        #    Only k and v are cached; q is only needed for the current tokens.
+        if kv_cache is not None:
+            k, v = kv_cache.update(self.layer_idx, k, v)  # [S, 8, 128], S = past + T
+        S = k.shape[0]
+
+        # 5. Grouped-query attention: 16 query heads share 8 KV heads, 2 query heads per
+        #    KV head. Query heads 0,1 use KV head 0; 2,3 use KV head 1; and so on. Only 8
+        #    heads are stored in the cache, which halves KV memory compared to 16.
+        #    The explicit version would be  k = k.repeat_interleave(2, dim=1)  (same for v),
+        #    but that copies the whole cache in every layer at every step. SDPA's
+        #    enable_gqa=True does the same head mapping without materializing the copy.
+
+        # 6. Causal mask. Our T queries sit at absolute positions S-T .. S-1, so query i may
+        #    see keys 0 .. (S - T + i). With no cache S == T and this is the usual lower
+        #    triangle. During decode (T=1) the single query sees every key. SDPA's
+        #    is_causal=True assumes S == T, which is why we build the mask ourselves.
+        q_pos = torch.arange(S - T, S, device=x.device)[:, None]  # [T, 1]
+        k_pos = torch.arange(S, device=x.device)[None, :]  # [1, S]
+        mask = k_pos <= q_pos  # [T, S], True = may attend
+
+        # SDPA wants [heads, seq, dim].
+        out = F.scaled_dot_product_attention(
+            q.transpose(0, 1),  # [16, T, 128]
+            k.transpose(0, 1),  # [8, S, 128]
+            v.transpose(0, 1),  # [8, S, 128]
+            attn_mask=mask,
+            scale=self.scale,
+            enable_gqa=True,
+        )  # [16, T, 128]
+
+        # 7. Merge heads and project back to the hidden size.
+        out = out.transpose(0, 1).reshape(T, self.num_heads * self.head_dim)  # [T, 2048]
+        return self.o_proj(out)  # [T, 1024]
 
 
 class MLP(nn.Module):
@@ -167,8 +230,11 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """SwiGLU: down(silu(gate(x)) * up(x)).  x: [T, hidden] -> [T, hidden]"""
-        raise NotImplementedError("TODO(you): MLP.forward")
+        """SwiGLU: down(silu(gate(x)) * up(x)).  x: [T, hidden] -> [T, hidden]
+
+        The gate branch decides how much of each up-projected feature passes through.
+        """
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class DecoderLayer(nn.Module):
@@ -186,11 +252,11 @@ class DecoderLayer(nn.Module):
         sin: torch.Tensor,
         kv_cache: KVCache | None = None,
     ) -> torch.Tensor:
-        """Pre-norm residual block:
-            x = x + attn(input_layernorm(x))
-            x = x + mlp(post_attention_layernorm(x))
-        """
-        raise NotImplementedError("TODO(you): DecoderLayer.forward")
+        """Pre-norm residual block: normalize the input to each sublayer, then add its output
+        back to the un-normalized residual stream."""
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, kv_cache)
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return x
 
 
 class Qwen3Model(nn.Module):
@@ -207,12 +273,15 @@ class Qwen3Model(nn.Module):
         positions: torch.Tensor,
         kv_cache: KVCache | None = None,
     ) -> torch.Tensor:
-        """input_ids [T], positions [T] -> final hidden states [T, hidden] (after the final norm)
-
-        Compute cos/sin once and share them across all layers. If kv_cache is given,
-        call kv_cache.advance(T) after the last layer.
-        """
-        raise NotImplementedError("TODO(you): Qwen3Model.forward")
+        """input_ids [T], positions [T] -> final hidden states [T, hidden] (after the final norm)"""
+        # cos/sin depend only on positions, so compute them once and share across all 28 layers.
+        cos, sin = self.rotary_emb(positions)
+        x = self.embed_tokens(input_ids)  # [T, 1024]
+        for layer in self.layers:
+            x = layer(x, cos, sin, kv_cache)
+        if kv_cache is not None:
+            kv_cache.advance(input_ids.shape[0])  # once per forward pass, after every layer wrote
+        return self.norm(x)
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -231,6 +300,7 @@ class Qwen3ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         """input_ids [T], positions [T] -> logits [T, vocab_size]
 
-        (Later optimization, not now: during prefill you only need logits for the last token.)
+        (Later optimization: during prefill only the last token's logits are needed. Skipping
+        the other T-1 rows of this 1024 x 151936 matmul saves real time on long prompts.)
         """
-        raise NotImplementedError("TODO(you): Qwen3ForCausalLM.forward")
+        return self.lm_head(self.model(input_ids, positions, kv_cache))

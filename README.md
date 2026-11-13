@@ -1,6 +1,6 @@
-# mini-serve
+# LLM Serving Engine
 
-A small LLM serving engine built from scratch in PyTorch: continuous batching, paged KV cache,
+An LLM serving engine built from scratch in PyTorch: continuous batching, paged KV cache,
 prefix caching, and an OpenAI-compatible streaming API, serving Qwen3-0.6B. It also has a live
 dashboard and is benchmarked against vLLM.
 

@@ -17,6 +17,8 @@ from engine.generate import generate
 from engine.request import RequestStatus, SamplingParams
 from engine.scheduler import Scheduler
 from engine.request import Request
+from engine.batch_cache import SlotManager
+from types import SimpleNamespace
 from tests.prompts import PROMPTS
 
 pytestmark = pytest.mark.needs_model
@@ -39,16 +41,19 @@ def make_engine(model, **kw):
     kw.setdefault("max_num_seqs", 4)
     kw.setdefault("max_model_len", 128)
     kw.setdefault("max_num_batched_tokens", 128)
+    if kw.setdefault("kv_cache", "paged") == "paged":
+        kw.setdefault("num_kv_blocks", 256)
     return LLMEngine(model, **kw)
 
 
+@pytest.mark.parametrize("kv_cache", ["slot", "paged"])
 @pytest.mark.parametrize("policy", ["continuous", "static"])
 @pytest.mark.parametrize("max_num_seqs", [1, 4, 16])
-def test_batched_greedy_matches_single(our_model, prompts, single_outputs, policy, max_num_seqs):
-    eng = make_engine(our_model, policy=policy, max_num_seqs=max_num_seqs)
+def test_batched_greedy_matches_single(our_model, prompts, single_outputs, policy, max_num_seqs, kv_cache):
+    eng = make_engine(our_model, policy=policy, max_num_seqs=max_num_seqs, kv_cache=kv_cache)
     outs = eng.generate(prompts, [SamplingParams(max_new_tokens=n) for n in LENS])
     for i, (a, b) in enumerate(zip(outs, single_outputs)):
-        assert a == b, f"request {i} differs when batched ({policy}, max_num_seqs={max_num_seqs})"
+        assert a == b, f"request {i} differs when batched ({kv_cache}, {policy}, max_num_seqs={max_num_seqs})"
 
 
 def test_prefill_token_budget_splits_admission(our_model, prompts, single_outputs):
@@ -130,26 +135,31 @@ def test_events_log(our_model, prompts, tmp_path):
 # ---------------------------------------------------------------- scheduler unit tests (no model)
 
 
+def _slots(n):
+    return SlotManager(SimpleNamespace(num_slots=n, max_len=100))
+
+
 def _req(n_prompt, n_new=4):
     return Request(prompt_ids=[1] * n_prompt, params=SamplingParams(max_new_tokens=n_new), arrival_time=0.0)
 
 
 def test_scheduler_continuous_refills_freed_slot():
-    s = Scheduler(max_num_seqs=2, max_num_batched_tokens=100, policy="continuous")
+    s = Scheduler(_slots(2), max_num_seqs=2, max_num_batched_tokens=100, policy="continuous")
     a, b, c = _req(5), _req(5), _req(5)
     for r in (a, b, c):
         s.add(r)
     step = s.schedule()
     assert step.kind == "prefill" and step.requests == [a, b] and {a.slot, b.slot} == {0, 1}
     assert s.schedule().kind == "decode"
+    a_slot = a.slot
     a.status = RequestStatus.FINISHED
     assert s.release_finished() == [a]
     step = s.schedule()
-    assert step.kind == "prefill" and step.requests == [c] and c.slot == a.slot  # reuses the freed slot
+    assert step.kind == "prefill" and step.requests == [c] and c.slot == a_slot  # reuses the freed slot
 
 
 def test_scheduler_static_waits_for_whole_batch():
-    s = Scheduler(max_num_seqs=2, max_num_batched_tokens=100, policy="static")
+    s = Scheduler(_slots(2), max_num_seqs=2, max_num_batched_tokens=100, policy="static")
     a, b, c = _req(5), _req(5), _req(5)
     for r in (a, b, c):
         s.add(r)
@@ -164,7 +174,7 @@ def test_scheduler_static_waits_for_whole_batch():
 
 
 def test_scheduler_token_budget():
-    s = Scheduler(max_num_seqs=8, max_num_batched_tokens=10, policy="continuous")
+    s = Scheduler(_slots(8), max_num_seqs=8, max_num_batched_tokens=10, policy="continuous")
     reqs = [_req(4) for _ in range(5)]
     for r in reqs:
         s.add(r)

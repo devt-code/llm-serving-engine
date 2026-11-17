@@ -1,21 +1,27 @@
 """The serving engine loop: schedule -> build batch -> forward -> sample -> update.
 
-    engine = LLMEngine(model, max_num_seqs=32, policy="continuous")
+    engine = LLMEngine(model, kv_cache="paged", kv_cache_gb=2.0)
     engine.add_request(prompt_ids, SamplingParams(max_new_tokens=64))
     while engine.has_unfinished():
         finished = engine.step()
 
 Every call to step() is one forward pass of the model:
-  - a PREFILL step packs the prompts of newly admitted requests into one flat sequence, or
+  - a PREFILL step packs the sequences of newly admitted requests into one flat sequence, or
   - a DECODE step feeds the last sampled token of every running request (one token each).
+
+KV cache types:
+  - "paged" (Phase 3, default): shared pool of 16-token blocks, allocated as requests grow,
+    with preemption when the pool runs out. Size it with kv_cache_gb or num_kv_blocks.
+  - "slot"  (Phase 2): one max_model_len region per request; max_num_seqs slots.
 """
 
 from typing import Literal
 
 import torch
 
-from engine.batch_cache import DecodeBatch, PrefillBatch, SlotKVCache
+from engine.batch_cache import SlotKVCache, SlotManager
 from engine.events import EventLog
+from engine.kv_cache import BlockManager, PagedKVCache
 from engine.model import Qwen3ForCausalLM
 from engine.request import Request, RequestStatus, SamplingParams
 from engine.sampler import sample
@@ -30,6 +36,10 @@ class LLMEngine:
         max_model_len: int = 512,
         max_num_batched_tokens: int = 2048,
         policy: Literal["continuous", "static"] = "continuous",
+        kv_cache: Literal["paged", "slot"] = "paged",
+        kv_cache_gb: float | None = None,
+        num_kv_blocks: int | None = None,
+        block_size: int = 16,
         event_log: EventLog | None = None,
     ):
         if max_num_batched_tokens < max_model_len:
@@ -39,14 +49,30 @@ class LLMEngine:
         dtype = model.lm_head.weight.dtype
         self.max_model_len = max_model_len
         self.policy = policy
-        self.cache = SlotKVCache(model.config, max_num_seqs, max_model_len, self.device, dtype)
-        self.scheduler = Scheduler(max_num_seqs, max_num_batched_tokens, policy)
         self.events = event_log or EventLog()
-        self.eos = model.config.eos_token_id
+        config = model.config
+
+        if kv_cache == "slot":
+            self.cache = SlotKVCache(config, max_num_seqs, max_model_len, self.device, dtype)
+            self.memory = SlotManager(self.cache)
+        elif kv_cache == "paged":
+            if num_kv_blocks is None:
+                gb = kv_cache_gb if kv_cache_gb is not None else 2.0
+                num_kv_blocks = int(gb * 1e9) // PagedKVCache.bytes_per_block(config, block_size, dtype)
+            self.cache = PagedKVCache(config, num_kv_blocks, block_size, self.device, dtype)
+            self.memory = BlockManager(self.cache, self.events)
+        else:
+            raise ValueError(f"unknown kv_cache {kv_cache!r}")
+
+        self.scheduler = Scheduler(self.memory, max_num_seqs, max_num_batched_tokens, policy)
+        self.eos = config.eos_token_id
         self.step_count = 0
+        self.peak_running = 0
         self.events.emit(
-            "engine_started", policy=policy, max_num_seqs=max_num_seqs, max_model_len=max_model_len,
-            kv_cache_bytes=self.cache.nbytes, device=str(self.device),
+            "engine_started", policy=policy, kv_cache=kv_cache, max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len, kv_cache_bytes=self.cache.nbytes, device=str(self.device),
+            block_size=block_size if kv_cache == "paged" else None,
+            **self.memory.usage(),
         )
 
     # ------------------------------------------------------------------ public API
@@ -56,10 +82,11 @@ class LLMEngine:
     ) -> Request:
         if not prompt_ids:
             raise ValueError("empty prompt")
-        if len(prompt_ids) + params.max_new_tokens > self.max_model_len:
+        limit = min(self.max_model_len, self.memory.max_request_tokens)
+        if len(prompt_ids) + params.max_new_tokens > limit:
             raise ValueError(
-                f"prompt ({len(prompt_ids)}) + max_new_tokens ({params.max_new_tokens}) exceeds "
-                f"max_model_len ({self.max_model_len})"
+                f"prompt ({len(prompt_ids)}) + max_new_tokens ({params.max_new_tokens}) exceeds the "
+                f"per-request limit ({limit} tokens)"
             )
         req = Request(prompt_ids=list(prompt_ids), params=params, arrival_time=self.events.now())
         if request_id is not None:
@@ -99,7 +126,11 @@ class LLMEngine:
         scheduled = self.scheduler.schedule()
         if scheduled is None:
             return []
+        for r in scheduled.preempted:
+            self.events.emit("request_preempted", id=r.request_id, num_computed_lost=len(r.all_token_ids) - 1)
         reqs = scheduled.requests
+        if not reqs:  # everyone got preempted this step; the next step re-admits
+            return []
 
         if scheduled.kind == "prefill":
             logits = self._prefill(reqs)
@@ -108,27 +139,33 @@ class LLMEngine:
 
         next_tokens = self._sample(reqs, logits)  # .tolist() inside waits for the GPU
         finished = self._append_tokens(reqs, next_tokens)
+        self.peak_running = max(self.peak_running, len(self.scheduler.running))
         self.scheduler.release_finished()
 
         self.events.emit(
             "step", step=self.step_count, kind=scheduled.kind, num_seqs=len(reqs),
-            num_tokens=sum(len(r.prompt_ids) for r in reqs) if scheduled.kind == "prefill" else len(reqs),
+            num_tokens=sum(len(r.all_token_ids) for r in reqs) if scheduled.kind == "prefill" else len(reqs),
             running=[r.request_id for r in self.scheduler.running],
-            slots=[r.slot for r in self.scheduler.running],
             waiting=len(self.scheduler.waiting),
+            num_preempted=len(scheduled.preempted),
             duration_ms=round((self.events.now() - t_start) * 1000, 3),
+            **self.memory.usage(),
         )
         self.step_count += 1
         return finished
 
     def _prefill(self, reqs: list[Request]) -> torch.Tensor:
+        # A preempted request is recomputed: its prompt AND the tokens it already generated.
+        seqs = [r.all_token_ids for r in reqs]
         for r in reqs:
-            self.events.emit("request_started", id=r.request_id, slot=r.slot)
-        batch = PrefillBatch(self.cache, [r.slot for r in reqs], [len(r.prompt_ids) for r in reqs])
-        input_ids = torch.tensor([t for r in reqs for t in r.prompt_ids], device=self.device)
+            kind = "request_resumed" if r.num_preemptions else "request_started"
+            blocks = list(r.block_table) if r.block_table is not None else None  # copy: the table grows later
+            self.events.emit(kind, id=r.request_id, slot=r.slot, blocks=blocks)
+        batch = self.memory.prefill_batch(reqs, [len(s) for s in seqs])
+        input_ids = torch.tensor([t for s in seqs for t in s], device=self.device)
         logits = self.model(input_ids, batch.positions, batch, logits_indices=batch.last_token_idx)  # [B, V]
-        for r in reqs:
-            r.num_computed = len(r.prompt_ids)
+        for r, s in zip(reqs, seqs):
+            r.num_computed = len(s)
         return logits
 
     def _decode(self, reqs: list[Request]) -> torch.Tensor:
@@ -136,7 +173,7 @@ class LLMEngine:
         # (Static batching only: a request that already finished keeps rewriting its last
         # position. Its compute is wasted, which is the point of the comparison.)
         positions = [r.num_computed for r in reqs]
-        batch = DecodeBatch(self.cache, [r.slot for r in reqs], [p + 1 for p in positions])
+        batch = self.memory.decode_batch(reqs, [p + 1 for p in positions])
         input_ids = torch.tensor([r.last_token for r in reqs], device=self.device)
         logits = self.model(input_ids, torch.tensor(positions, device=self.device), batch)  # [B, V]
         for r in reqs:
@@ -158,7 +195,7 @@ class LLMEngine:
         finished = []
         for r, tok in zip(reqs, next_tokens):
             if r.is_finished:
-                continue  # static batching: slot still computed, output discarded
+                continue  # static batching: still computed, output discarded
             r.output_ids.append(tok)
             if r.first_token_time is None:
                 r.first_token_time = now
@@ -174,6 +211,7 @@ class LLMEngine:
                 r.finish_reason = reason
                 finished.append(r)
                 self.events.emit(
-                    "request_finished", id=r.request_id, output_len=len(r.output_ids), reason=reason, slot=r.slot
+                    "request_finished", id=r.request_id, output_len=len(r.output_ids), reason=reason,
+                    num_preemptions=r.num_preemptions,
                 )
         return finished

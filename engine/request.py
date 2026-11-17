@@ -38,10 +38,13 @@ class Request:
 
     status: RequestStatus = RequestStatus.WAITING
     output_ids: list[int] = field(default_factory=list)
-    slot: int | None = None
+    slot: int | None = None  # slot cache (Phase 2)
+    block_table: list[int] | None = None  # paged cache (Phase 3): logical block -> physical block
     # How many of this request's tokens have their K/V in the cache. After prefill this is
-    # len(prompt); each decode step adds one (the previously sampled token).
+    # len(prompt); each decode step adds one (the previously sampled token). Reset to 0 when
+    # the request is preempted (its cache is thrown away and recomputed later).
     num_computed: int = 0
+    num_preemptions: int = 0
     first_token_time: float | None = None
     finish_time: float | None = None
     finish_reason: str | None = None  # "stop" (EOS) or "length" (hit max_new_tokens)
@@ -50,6 +53,11 @@ class Request:
     @property
     def last_token(self) -> int:
         return self.output_ids[-1]
+
+    @property
+    def all_token_ids(self) -> list[int]:
+        """Prompt plus everything generated so far: what a (re)prefill has to process."""
+        return self.prompt_ids + self.output_ids
 
     @property
     def total_len(self) -> int:

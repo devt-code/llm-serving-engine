@@ -11,12 +11,41 @@ Each forward pass gets a small "batch" object describing which tokens belong to 
 It implements the attention-backend protocol from engine/model.py (`attend` and `advance`):
   - PrefillBatch: several fresh prompts concatenated into one flat sequence.
   - DecodeBatch:  one new token for each of B running requests.
+
+`SlotManager` is the memory manager the scheduler talks to (same interface as the paged
+`BlockManager` in engine/kv_cache.py): can_admit / allocate / ensure_capacity / free, plus
+building the batch objects.
 """
+
+import heapq
 
 import torch
 import torch.nn.functional as F
 
 from engine.config import Qwen3Config
+
+
+def packed_prefill_layout(seq_lens: list[int], device: torch.device) -> dict[str, torch.Tensor]:
+    """Index tensors for packing several sequences into one flat token list.
+
+    Returns:
+      seq_idx        [T]    which sequence each token belongs to
+      positions      [T]    position of each token inside its own sequence (0,1,2, 0,1, ...)
+      mask           [T, T] block-diagonal causal mask (see PrefillBatch docstring)
+      last_token_idx [B]    row of each sequence's last token
+    """
+    lens = torch.tensor(seq_lens, device=device)
+    seq_idx = torch.repeat_interleave(torch.arange(len(seq_lens), device=device), lens)
+    starts = torch.cumsum(lens, 0) - lens
+    positions = torch.arange(int(lens.sum()), device=device) - starts[seq_idx]
+    same_seq = seq_idx[:, None] == seq_idx[None, :]
+    causal = positions[:, None] >= positions[None, :]
+    return {
+        "seq_idx": seq_idx,
+        "positions": positions,
+        "mask": same_seq & causal,  # built once, shared by all 28 layers
+        "last_token_idx": torch.cumsum(lens, 0) - 1,
+    }
 
 
 class SlotKVCache:
@@ -53,19 +82,13 @@ class PrefillBatch:
     """
 
     def __init__(self, cache: SlotKVCache, slot_ids: list[int], prompt_lens: list[int]):
-        dev = cache.device
         self.cache = cache
-        lens = torch.tensor(prompt_lens, device=dev)
-        seq_idx = torch.repeat_interleave(torch.arange(len(prompt_lens), device=dev), lens)  # [T] which prompt
-        # Position of each token inside its own prompt: 0,1,2, 0,1, ...
-        starts = torch.cumsum(lens, 0) - lens
-        self.positions = torch.arange(int(lens.sum()), device=dev) - starts[seq_idx]  # [T]
-        self.slot_of_token = torch.tensor(slot_ids, device=dev)[seq_idx]  # [T]
-        same_prompt = seq_idx[:, None] == seq_idx[None, :]
-        causal = self.positions[:, None] >= self.positions[None, :]
-        self.mask = same_prompt & causal  # [T, T], built once, shared by all 28 layers
+        layout = packed_prefill_layout(prompt_lens, cache.device)
+        self.positions = layout["positions"]  # [T]
+        self.mask = layout["mask"]  # [T, T]
         # Row of each prompt's last token: the only rows we need logits for.
-        self.last_token_idx = torch.cumsum(lens, 0) - 1  # [B]
+        self.last_token_idx = layout["last_token_idx"]  # [B]
+        self.slot_of_token = torch.tensor(slot_ids, device=cache.device)[layout["seq_idx"]]  # [T]
 
     def attend(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
         # Write every token's k/v into (its slot, its position).
@@ -127,3 +150,41 @@ class DecodeBatch:
 
     def advance(self, num_tokens: int) -> None:
         pass
+
+
+class SlotManager:
+    """Memory manager for SlotKVCache: each running request owns one whole slot."""
+
+    kind = "slot"
+
+    def __init__(self, cache: SlotKVCache):
+        self.cache = cache
+        self.free_slots = list(range(cache.num_slots))  # min-heap: lowest free slot first
+
+    @property
+    def max_request_tokens(self) -> int:
+        return self.cache.max_len
+
+    def can_admit(self, req, num_tokens: int) -> bool:
+        return bool(self.free_slots) and num_tokens <= self.cache.max_len
+
+    def allocate(self, req, num_tokens: int) -> None:
+        req.slot = heapq.heappop(self.free_slots)
+
+    def ensure_capacity(self, req, num_tokens: int) -> bool:
+        # The whole max_len was reserved at admission, so there's always room.
+        return num_tokens <= self.cache.max_len
+
+    def free(self, req) -> None:
+        heapq.heappush(self.free_slots, req.slot)
+        req.slot = None
+
+    def prefill_batch(self, reqs, seq_lens: list[int]) -> PrefillBatch:
+        return PrefillBatch(self.cache, [r.slot for r in reqs], seq_lens)
+
+    def decode_batch(self, reqs, context_lens: list[int]) -> DecodeBatch:
+        return DecodeBatch(self.cache, [r.slot for r in reqs], context_lens)
+
+    def usage(self) -> dict:
+        total = self.cache.num_slots
+        return {"kv_unit": "slot", "kv_used": total - len(self.free_slots), "kv_total": total}

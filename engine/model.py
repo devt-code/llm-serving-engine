@@ -108,19 +108,19 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
 
 
 class KVCache:
-    """Simple contiguous KV cache for ONE request (Phase 1). Replaced by the paged cache in Phase 3.
+    """Simple contiguous KV cache for ONE request (Phase 1).
 
     Per layer, a K and a V tensor of shape [max_len, num_key_value_heads, head_dim] is
     preallocated up front. That upfront reservation of max_len slots per request is exactly
     the memory waste the paged cache fixes later.
 
-    Protocol used by the model:
-      - During a forward pass over T new tokens, each layer calls
-            k_all, v_all = cache.update(layer_idx, k_new, v_new)
-        which writes k_new/v_new into slots [seq_len, seq_len + T) and returns views of
-        slots [0, seq_len + T), i.e. all keys/values so far.
-      - After ALL layers have run, the model calls cache.advance(T) once, so seq_len only
-        moves forward once per forward pass (not once per layer).
+    Attention-backend protocol (shared with engine/batch_cache.py, and later the paged cache):
+      - attend(layer_idx, q, k, v, scale) -> [T, Hq, D]
+            Store this forward pass's new k/v, then attend q over everything cached so far.
+            Each cache type decides how keys are laid out and how the mask is built.
+      - advance(T)
+            Called by the model ONCE per forward pass, after all layers ran, so lengths
+            move forward once per forward pass (not once per layer).
     """
 
     def __init__(self, config: Qwen3Config, max_len: int, device: torch.device, dtype: torch.dtype):
@@ -138,6 +138,32 @@ class KVCache:
         self.v[layer_idx][start:end] = v
         # Slicing returns views (no copy).
         return self.k[layer_idx][:end], self.v[layer_idx][:end]
+
+    def attend(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
+        """q [T, Hq, D], k/v [T, Hkv, D] (this step's tokens only) -> [T, Hq, D]"""
+        T = q.shape[0]
+        # Append this step's k/v and get ALL keys/values so far. Only k and v are cached;
+        # q is only needed for the current tokens.
+        k, v = self.update(layer_idx, k, v)  # [S, Hkv, D], S = past + T
+        S = k.shape[0]
+
+        # Causal mask. Our T queries sit at absolute positions S-T .. S-1, so query i may
+        # see keys 0 .. (S - T + i). With no past S == T and this is the usual lower
+        # triangle. During decode (T=1) the single query sees every key. SDPA's
+        # is_causal=True assumes S == T, which is why we build the mask ourselves.
+        q_pos = torch.arange(S - T, S, device=q.device)[:, None]  # [T, 1]
+        k_pos = torch.arange(S, device=q.device)[None, :]  # [1, S]
+        mask = k_pos <= q_pos  # [T, S], True = may attend
+
+        out = F.scaled_dot_product_attention(
+            q.transpose(0, 1),  # [Hq, T, D]   (SDPA wants [heads, seq, dim])
+            k.transpose(0, 1),  # [Hkv, S, D]
+            v.transpose(0, 1),
+            attn_mask=mask,
+            scale=scale,
+            enable_gqa=True,
+        )
+        return out.transpose(0, 1)  # [T, Hq, D]
 
     def advance(self, num_tokens: int) -> None:
         self.seq_len += num_tokens
@@ -186,39 +212,27 @@ class Attention(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
-        # 4. Append this step's k/v to the cache and get ALL keys/values so far.
-        #    Only k and v are cached; q is only needed for the current tokens.
-        if kv_cache is not None:
-            k, v = kv_cache.update(self.layer_idx, k, v)  # [S, 8, 128], S = past + T
-        S = k.shape[0]
-
-        # 5. Grouped-query attention: 16 query heads share 8 KV heads, 2 query heads per
-        #    KV head. Query heads 0,1 use KV head 0; 2,3 use KV head 1; and so on. Only 8
-        #    heads are stored in the cache, which halves KV memory compared to 16.
+        # 4. Attention. Grouped-query attention: 16 query heads share 8 KV heads, 2 query
+        #    heads per KV head. Query heads 0,1 use KV head 0; 2,3 use KV head 1; and so on.
+        #    Only 8 heads are stored in the cache, which halves KV memory compared to 16.
         #    The explicit version would be  k = k.repeat_interleave(2, dim=1)  (same for v),
         #    but that copies the whole cache in every layer at every step. SDPA's
         #    enable_gqa=True does the same head mapping without materializing the copy.
+        if kv_cache is None:
+            # No cache: plain causal self-attention over these T tokens (S == T, so
+            # is_causal=True is correct here).
+            out = F.scaled_dot_product_attention(
+                q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1),
+                is_causal=True, scale=self.scale, enable_gqa=True,
+            ).transpose(0, 1)
+        else:
+            # The cache stores this step's k/v and attends over everything so far. How it
+            # lays out keys and builds the mask depends on the cache type (one request,
+            # a batch of requests, or later a paged cache).
+            out = kv_cache.attend(self.layer_idx, q, k, v, self.scale)  # [T, 16, 128]
 
-        # 6. Causal mask. Our T queries sit at absolute positions S-T .. S-1, so query i may
-        #    see keys 0 .. (S - T + i). With no cache S == T and this is the usual lower
-        #    triangle. During decode (T=1) the single query sees every key. SDPA's
-        #    is_causal=True assumes S == T, which is why we build the mask ourselves.
-        q_pos = torch.arange(S - T, S, device=x.device)[:, None]  # [T, 1]
-        k_pos = torch.arange(S, device=x.device)[None, :]  # [1, S]
-        mask = k_pos <= q_pos  # [T, S], True = may attend
-
-        # SDPA wants [heads, seq, dim].
-        out = F.scaled_dot_product_attention(
-            q.transpose(0, 1),  # [16, T, 128]
-            k.transpose(0, 1),  # [8, S, 128]
-            v.transpose(0, 1),  # [8, S, 128]
-            attn_mask=mask,
-            scale=self.scale,
-            enable_gqa=True,
-        )  # [16, T, 128]
-
-        # 7. Merge heads and project back to the hidden size.
-        out = out.transpose(0, 1).reshape(T, self.num_heads * self.head_dim)  # [T, 2048]
+        # 5. Merge heads and project back to the hidden size.
+        out = out.reshape(T, self.num_heads * self.head_dim)  # [T, 2048]
         return self.o_proj(out)  # [T, 1024]
 
 
@@ -297,10 +311,16 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_cache: KVCache | None = None,
+        logits_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """input_ids [T], positions [T] -> logits [T, vocab_size]
+        (or [len(logits_indices), vocab_size] if logits_indices is given)
 
-        (Later optimization: during prefill only the last token's logits are needed. Skipping
-        the other T-1 rows of this 1024 x 151936 matmul saves real time on long prompts.)
+        logits_indices: which token rows actually need logits. During prefill only the LAST
+        token of each prompt is sampled from, so skipping the other rows of this
+        1024 x 151936 matmul saves real time on long prompts.
         """
-        return self.lm_head(self.model(input_ids, positions, kv_cache))
+        hidden = self.model(input_ids, positions, kv_cache)
+        if logits_indices is not None:
+            hidden = hidden[logits_indices]
+        return self.lm_head(hidden)

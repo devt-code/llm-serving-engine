@@ -14,6 +14,7 @@ class SamplingParams:
     top_p: float = 1.0
     seed: int | None = None
     ignore_eos: bool = False  # benchmarks: always generate exactly max_new_tokens
+    stop_token_ids: tuple[int, ...] = ()  # extra token ids that end this request
 
     @property
     def greedy(self) -> bool:
@@ -40,6 +41,7 @@ class Request:
     output_ids: list[int] = field(default_factory=list)
     slot: int | None = None  # slot cache (Phase 2)
     block_table: list[int] | None = None  # paged cache (Phase 3): logical block -> physical block
+    block_hashes: list[int] = field(default_factory=list)  # prefix-cache hashes of its full blocks
     # How many of this request's tokens have their K/V in the cache. After prefill this is
     # len(prompt); each decode step adds one (the previously sampled token). Reset to 0 when
     # the request is preempted (its cache is thrown away and recomputed later).

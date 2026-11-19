@@ -88,12 +88,16 @@ class Scheduler:
         while self.waiting and len(self.running) < self.max_num_seqs:
             req = self.waiting[0]
             n = len(req.all_token_ids)
-            if n > budget or not self.memory.can_admit(req, n):
+            # Only tokens that aren't already in the prefix cache cost prefill compute.
+            to_compute = n - self.memory.num_cached_tokens(req)
+            if to_compute > budget or not self.memory.can_admit(req, n):
                 break
             self.waiting.popleft()
-            self.memory.allocate(req, n)
+            # allocate() returns how many leading tokens are already cached (prefix hit);
+            # the prefill step only computes the rest.
+            req.num_computed = self.memory.allocate(req, n)
             req.status = RequestStatus.RUNNING
-            budget -= n
+            budget -= n - req.num_computed
             admitted.append(req)
             self.running.append(req)
         return admitted
@@ -137,3 +141,17 @@ class Scheduler:
         for r in done:
             self.memory.free(r)
         return done
+
+    def abort(self, req: Request) -> bool:
+        """Stop a request immediately (e.g. its client disconnected). Returns False if it was
+        already finished. Must be called between steps, from the thread that runs step()."""
+        if req.is_finished:
+            return False
+        if req in self.waiting:
+            self.waiting.remove(req)
+        elif req in self.running:
+            self.running.remove(req)
+            self.memory.free(req)
+        req.status = RequestStatus.FINISHED
+        req.finish_reason = "abort"
+        return True

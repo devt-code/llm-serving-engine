@@ -19,6 +19,9 @@ class Qwen3Config:
     max_position_embeddings: int
     tie_word_embeddings: bool
     eos_token_id: int
+    # All token ids that end generation: config eos plus generation_config.json's eos list
+    # (Qwen3: <|im_end|> 151645 and <|endoftext|> 151643).
+    stop_token_ids: tuple[int, ...] = ()
 
     @property
     def num_kv_groups(self) -> int:
@@ -28,7 +31,13 @@ class Qwen3Config:
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "Qwen3Config":
         raw = json.loads((Path(model_dir) / "config.json").read_text())
+        stop = [raw["eos_token_id"]]
+        gen_path = Path(model_dir) / "generation_config.json"
+        if gen_path.exists():
+            gen_eos = json.loads(gen_path.read_text()).get("eos_token_id", [])
+            stop += gen_eos if isinstance(gen_eos, list) else [gen_eos]
         return cls(
+            stop_token_ids=tuple(dict.fromkeys(stop)),
             vocab_size=raw["vocab_size"],
             hidden_size=raw["hidden_size"],
             intermediate_size=raw["intermediate_size"],

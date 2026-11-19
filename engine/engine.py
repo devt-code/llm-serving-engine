@@ -40,6 +40,7 @@ class LLMEngine:
         kv_cache_gb: float | None = None,
         num_kv_blocks: int | None = None,
         block_size: int = 16,
+        enable_prefix_caching: bool = True,
         event_log: EventLog | None = None,
     ):
         if max_num_batched_tokens < max_model_len:
@@ -60,12 +61,12 @@ class LLMEngine:
                 gb = kv_cache_gb if kv_cache_gb is not None else 2.0
                 num_kv_blocks = int(gb * 1e9) // PagedKVCache.bytes_per_block(config, block_size, dtype)
             self.cache = PagedKVCache(config, num_kv_blocks, block_size, self.device, dtype)
-            self.memory = BlockManager(self.cache, self.events)
+            self.memory = BlockManager(self.cache, self.events, enable_prefix_caching=enable_prefix_caching)
         else:
             raise ValueError(f"unknown kv_cache {kv_cache!r}")
 
         self.scheduler = Scheduler(self.memory, max_num_seqs, max_num_batched_tokens, policy)
-        self.eos = config.eos_token_id
+        self.stop_token_ids = set(config.stop_token_ids or (config.eos_token_id,))
         self.step_count = 0
         self.peak_running = 0
         self.events.emit(
@@ -82,7 +83,7 @@ class LLMEngine:
     ) -> Request:
         if not prompt_ids:
             raise ValueError("empty prompt")
-        limit = min(self.max_model_len, self.memory.max_request_tokens)
+        limit = self.max_request_len
         if len(prompt_ids) + params.max_new_tokens > limit:
             raise ValueError(
                 f"prompt ({len(prompt_ids)}) + max_new_tokens ({params.max_new_tokens}) exceeds the "
@@ -105,6 +106,18 @@ class LLMEngine:
 
     def has_unfinished(self) -> bool:
         return self.scheduler.has_unfinished()
+
+    @property
+    def max_request_len(self) -> int:
+        """Longest prompt + max_new_tokens a single request may use."""
+        return min(self.max_model_len, self.memory.max_request_tokens)
+
+    def abort_request(self, req: Request) -> None:
+        """Cancel a request and free its memory. Call between steps."""
+        if self.scheduler.abort(req):
+            req.finish_time = self.events.now()
+            self.events.emit("request_finished", id=req.request_id, output_len=len(req.output_ids),
+                             reason="abort", num_preemptions=req.num_preemptions)
 
     def generate(
         self, prompts: list[list[int]], params: SamplingParams | list[SamplingParams] = SamplingParams()
@@ -133,9 +146,12 @@ class LLMEngine:
             return []
 
         if scheduled.kind == "prefill":
+            computed_before = sum(r.num_computed for r in reqs)
             logits = self._prefill(reqs)
+            tokens_computed = sum(r.num_computed for r in reqs) - computed_before
         else:
             logits = self._decode(reqs)
+            tokens_computed = len(reqs)
 
         next_tokens = self._sample(reqs, logits)  # .tolist() inside waits for the GPU
         finished = self._append_tokens(reqs, next_tokens)
@@ -144,7 +160,7 @@ class LLMEngine:
 
         self.events.emit(
             "step", step=self.step_count, kind=scheduled.kind, num_seqs=len(reqs),
-            num_tokens=sum(len(r.all_token_ids) for r in reqs) if scheduled.kind == "prefill" else len(reqs),
+            num_tokens=int(tokens_computed),
             running=[r.request_id for r in self.scheduler.running],
             waiting=len(self.scheduler.waiting),
             num_preempted=len(scheduled.preempted),
@@ -155,17 +171,21 @@ class LLMEngine:
         return finished
 
     def _prefill(self, reqs: list[Request]) -> torch.Tensor:
-        # A preempted request is recomputed: its prompt AND the tokens it already generated.
+        # Compute every token that isn't in the cache yet. For a new request that's the prompt
+        # minus any cached prefix; for a preempted one it's prompt + already-generated tokens
+        # (minus any prefix that survived in the cache).
         seqs = [r.all_token_ids for r in reqs]
+        new = [s[r.num_computed :] for r, s in zip(reqs, seqs)]
         for r in reqs:
             kind = "request_resumed" if r.num_preemptions else "request_started"
             blocks = list(r.block_table) if r.block_table is not None else None  # copy: the table grows later
-            self.events.emit(kind, id=r.request_id, slot=r.slot, blocks=blocks)
-        batch = self.memory.prefill_batch(reqs, [len(s) for s in seqs])
-        input_ids = torch.tensor([t for s in seqs for t in s], device=self.device)
+            self.events.emit(kind, id=r.request_id, slot=r.slot, blocks=blocks, cached_tokens=r.num_computed)
+        batch = self.memory.prefill_batch(reqs, [len(n) for n in new], [len(s) for s in seqs])
+        input_ids = torch.tensor([t for n in new for t in n], device=self.device)
         logits = self.model(input_ids, batch.positions, batch, logits_indices=batch.last_token_idx)  # [B, V]
         for r, s in zip(reqs, seqs):
             r.num_computed = len(s)
+            self.memory.commit(r)
         return logits
 
     def _decode(self, reqs: list[Request]) -> torch.Tensor:
@@ -179,6 +199,7 @@ class LLMEngine:
         for r in reqs:
             if not r.is_finished:
                 r.num_computed += 1
+                self.memory.commit(r)
         return logits
 
     def _sample(self, reqs: list[Request], logits: torch.Tensor) -> list[int]:
@@ -201,7 +222,7 @@ class LLMEngine:
                 r.first_token_time = now
                 self.events.emit("first_token", id=r.request_id)
             reason = None
-            if tok == self.eos and not r.params.ignore_eos:
+            if (tok in self.stop_token_ids or tok in r.params.stop_token_ids) and not r.params.ignore_eos:
                 reason = "stop"
             elif len(r.output_ids) >= r.params.max_new_tokens:
                 reason = "length"

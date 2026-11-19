@@ -26,8 +26,16 @@ def _bm(num_blocks=10, block_size=4, watermark=0.0):
     return BlockManager(cache, watermark=watermark)
 
 
-def _r(rid="r"):
-    return SimpleNamespace(request_id=rid, block_table=None)
+_tok = iter(range(10**9))
+
+
+def _r(rid="r", tokens=None):
+    """Stand-in request. Distinct token ids by default, so no accidental prefix hits."""
+    tokens = list(tokens) if tokens is not None else [next(_tok) for _ in range(256)]
+    return SimpleNamespace(
+        request_id=rid, block_table=None, block_hashes=[], prompt_ids=tokens, output_ids=[],
+        all_token_ids=tokens, num_preemptions=0, num_computed=0,
+    )
 
 
 def test_allocate_rounds_up_to_blocks():
@@ -158,7 +166,9 @@ def test_preempted_requests_resume_and_events_balance(our_model, prompts):
     preempted = {e["id"] for e in ev if e["type"] == "request_preempted"}
     resumed = {e["id"] for e in ev if e["type"] == "request_resumed"}
     assert preempted and preempted == resumed
-    allocated = sum(len(e["blocks"]) for e in ev if e["type"] == "blocks_allocated")
+    # A resumed request can get its own old blocks back as a prefix hit (they stay cached after
+    # preemption), so blocks come from either a fresh allocation or a prefix hit.
+    allocated = sum(len(e["blocks"]) for e in ev if e["type"] in ("blocks_allocated", "prefix_cache_hit"))
     freed = sum(len(e["blocks"]) for e in ev if e["type"] == "blocks_freed")
     assert allocated == freed
     steps = [e for e in ev if e["type"] == "step"]

@@ -22,6 +22,7 @@ class EventLog:
         self.t0 = time.perf_counter()
         self.events: list[dict] | None = [] if keep_in_memory else None
         self._file = None
+        self._listeners: list = []
         if path is not None:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             self._file = open(path, "w")
@@ -29,12 +30,26 @@ class EventLog:
     def now(self) -> float:
         return time.perf_counter() - self.t0
 
+    def subscribe(self, fn) -> None:
+        """fn(event: dict) is called for every event, on the thread that emits it (the engine
+        thread). Used by the API server to stream events to the dashboard over WebSocket."""
+        self._listeners.append(fn)
+
+    def unsubscribe(self, fn) -> None:
+        if fn in self._listeners:
+            self._listeners.remove(fn)
+
     def emit(self, type: str, **fields) -> None:
         event = {"t": round(self.now(), 6), "type": type, **fields}
         if self.events is not None:
             self.events.append(event)
         if self._file is not None:
             self._file.write(json.dumps(event) + "\n")
+        for fn in list(self._listeners):
+            try:
+                fn(event)
+            except Exception:  # a broken listener must never take down the engine
+                self.unsubscribe(fn)
 
     def close(self) -> None:
         if self._file is not None:

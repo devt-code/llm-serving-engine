@@ -168,8 +168,15 @@ class SlotManager:
     def can_admit(self, req, num_tokens: int) -> bool:
         return bool(self.free_slots) and num_tokens <= self.cache.max_len
 
-    def allocate(self, req, num_tokens: int) -> None:
+    def allocate(self, req, num_tokens: int) -> int:
         req.slot = heapq.heappop(self.free_slots)
+        return 0  # no prefix caching: nothing is ever already computed
+
+    def num_cached_tokens(self, req) -> int:
+        return 0
+
+    def commit(self, req) -> None:
+        pass
 
     def ensure_capacity(self, req, num_tokens: int) -> bool:
         # The whole max_len was reserved at admission, so there's always room.
@@ -179,8 +186,9 @@ class SlotManager:
         heapq.heappush(self.free_slots, req.slot)
         req.slot = None
 
-    def prefill_batch(self, reqs, seq_lens: list[int]) -> PrefillBatch:
-        return PrefillBatch(self.cache, [r.slot for r in reqs], seq_lens)
+    def prefill_batch(self, reqs, new_lens: list[int], context_lens: list[int]) -> PrefillBatch:
+        assert new_lens == context_lens, "slot cache always prefills from scratch"
+        return PrefillBatch(self.cache, [r.slot for r in reqs], new_lens)
 
     def decode_batch(self, reqs, context_lens: list[int]) -> DecodeBatch:
         return DecodeBatch(self.cache, [r.slot for r in reqs], context_lens)

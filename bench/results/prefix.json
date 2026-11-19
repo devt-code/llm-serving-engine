@@ -1,0 +1,77 @@
+{
+  "engine": "ours-prefix-caching",
+  "timestamp": "2026-11-18T20:30:13",
+  "device": "mps",
+  "dtype": "bfloat16",
+  "machine": "macOS-26.6.2-arm64-arm-64bit",
+  "torch": "2.15.0",
+  "workload": {
+    "num_requests": 128,
+    "prompt_tokens": 398,
+    "output_tokens": "32-96",
+    "ignore_eos": true,
+    "poisson_rate": 6.0
+  },
+  "results": [
+    {
+      "prefix_caching": false,
+      "output_tok_per_s": 199.5,
+      "total_s": 39.45,
+      "prompt_tokens": 51160,
+      "prefill_tokens_computed": 52800,
+      "prefix_hit_rate": 0.0,
+      "ttft_p50_ms": 16365.4,
+      "ttft_p99_ms": 35325.0,
+      "e2e_p50_s": 27.69,
+      "e2e_p99_s": 39.3,
+      "preemptions": 4,
+      "trace": "bench/traces/prefix_burst_off.jsonl",
+      "arrivals": "burst"
+    },
+    {
+      "prefix_caching": true,
+      "output_tok_per_s": 446.3,
+      "total_s": 17.64,
+      "prompt_tokens": 51160,
+      "prefill_tokens_computed": 5512,
+      "prefix_hit_rate": 0.8923,
+      "ttft_p50_ms": 5118.9,
+      "ttft_p99_ms": 12665.9,
+      "e2e_p50_s": 12.99,
+      "e2e_p99_s": 17.53,
+      "preemptions": 0,
+      "trace": "bench/traces/prefix_burst_on.jsonl",
+      "arrivals": "burst"
+    },
+    {
+      "prefix_caching": false,
+      "output_tok_per_s": 202.0,
+      "total_s": 38.96,
+      "prompt_tokens": 51160,
+      "prefill_tokens_computed": 52809,
+      "prefix_hit_rate": 0.0,
+      "ttft_p50_ms": 7183.7,
+      "ttft_p99_ms": 14607.0,
+      "e2e_p50_s": 17.58,
+      "e2e_p99_s": 23.67,
+      "preemptions": 4,
+      "trace": "bench/traces/prefix_poisson_off.jsonl",
+      "arrivals": "poisson@6/s"
+    },
+    {
+      "prefix_caching": true,
+      "output_tok_per_s": 338.8,
+      "total_s": 23.23,
+      "prompt_tokens": 51160,
+      "prefill_tokens_computed": 1944,
+      "prefix_hit_rate": 0.962,
+      "ttft_p50_ms": 29.3,
+      "ttft_p99_ms": 46.0,
+      "e2e_p50_s": 3.88,
+      "e2e_p99_s": 6.67,
+      "preemptions": 0,
+      "trace": "bench/traces/prefix_poisson_on.jsonl",
+      "arrivals": "poisson@6/s"
+    }
+  ]
+}

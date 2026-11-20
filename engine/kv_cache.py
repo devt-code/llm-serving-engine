@@ -134,6 +134,32 @@ class PagedAttentionBatch:
         key_pos = torch.arange(self.L, device=dev)
         self.mask = (key_pos[None, None, :] <= q_pos[:, :, None])[:, None]  # causal also bounds by ctx
 
+        # Decode with mixed context lengths: padding every request to the longest one wastes most
+        # of the gather when short and long requests share a batch (e.g. 30-token chats next to
+        # 400-token system-prompt chats). Sorting by length and attending in a few groups copies
+        # far less, for a few extra kernel launches. Used only when it saves enough.
+        self.groups = None
+        if self.Tmax == 1 and self.B >= 16:
+            self.groups = self._length_groups(block_tables, context_lens)
+
+    def _length_groups(self, block_tables, context_lens, num_groups: int = 4, min_saving: float = 0.3):
+        dev, bs = self.cache.device, self.cache.block_size
+        order = sorted(range(self.B), key=lambda i: context_lens[i])
+        size = -(-self.B // num_groups)
+        chunks = [order[i : i + size] for i in range(0, self.B, size)]
+        cost = sum(len(c) * (-(-max(context_lens[i] for i in c) // bs)) for c in chunks)
+        if cost > (1 - min_saving) * self.B * (self.L // bs):
+            return None
+        groups = []
+        for c in chunks:
+            ctx = [context_lens[i] for i in c]
+            cols = -(-max(ctx) // bs)
+            tables = _padded_tables([block_tables[i] for i in c], cols, dev)
+            lens = torch.tensor(ctx, device=dev)
+            mask = (torch.arange(cols * bs, device=dev)[None, :] < lens[:, None])[:, None, None, :]
+            groups.append((torch.tensor(c, device=dev), tables.flatten(), len(c), cols * bs, mask))
+        return groups
+
     def attend(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
         """q [T, Hq, D], k/v [T, Hkv, D] (this step's new tokens) -> [T, Hq, D]"""
         k_flat, v_flat = self.cache.flat(layer_idx)
@@ -141,6 +167,16 @@ class PagedAttentionBatch:
         v_flat[self.slot_mapping] = v
 
         Hq, Hkv, D = q.shape[1], self.cache.num_kv_heads, self.cache.head_dim
+        if self.groups is not None:
+            kc, vc = self.cache.k[layer_idx], self.cache.v[layer_idx]
+            out = torch.empty_like(q)
+            for idx, flat, Bg, Lg, mask in self.groups:
+                keys = kc.index_select(0, flat).view(Bg, Lg, Hkv, D).transpose(1, 2)
+                values = vc.index_select(0, flat).view(Bg, Lg, Hkv, D).transpose(1, 2)
+                o = F.scaled_dot_product_attention(q.index_select(0, idx)[:, :, None, :], keys, values,
+                                                   attn_mask=mask, scale=scale, enable_gqa=True)
+                out.index_copy_(0, idx, o[:, :, 0, :])
+            return out
         # Gather each request's blocks: [B * num_cols, bs, Hkv, D] -> [B, Hkv, L, D].
         # index_select on a flat index is ~4x faster than advanced indexing (pool[tables]) on
         # MPS for this shape (measured: 0.84 vs 3.29 ms per layer at B=32, L=288).
@@ -305,7 +341,7 @@ class BlockManager:
 
     def free(self, req) -> None:
         if req.block_table:
-            self._emit("blocks_freed", req, req.block_table)
+            cached = []
             # Reverse order: the LAST blocks of a sequence are the least useful prefixes, so they
             # should be evicted first. Insert them into the LRU first (= oldest).
             for b in reversed(req.block_table):
@@ -314,8 +350,12 @@ class BlockManager:
                     continue  # still shared with another running request
                 if b in self.block_hash:
                     self.evictable[b] = None  # keep contents for future prefix hits
+                    cached.append(b)
                 else:
                     self.free_blocks.append(b)
+            # `blocks` = released by this request; `cached` = those now idle but kept for reuse.
+            # (A block in `blocks` but not `cached` may still be in use by another request.)
+            self._emit("blocks_freed", req, req.block_table, cached=cached)
         req.block_table = None
         req.block_hashes = []
 

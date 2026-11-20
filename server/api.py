@@ -10,6 +10,7 @@ Endpoints
     POST /v1/chat/completions     messages -> assistant msg (stream: server-sent events)
     GET  /v1/stats                running / waiting / KV usage / prefix hit rate
     WS   /v1/events               live engine events as JSON (for the dashboard)
+    POST /v1/demo/load            start N synthetic requests server-side (dashboard load button)
 
 Works with the official OpenAI client:
     from openai import OpenAI
@@ -19,7 +20,9 @@ Works with the official OpenAI client:
 
 import argparse
 import asyncio
+import itertools
 import json
+import random
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -80,6 +83,29 @@ class ChatCompletionRequest(_Lenient):
     stop: str | list[str] | None = None
     seed: int | None = None
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)  # e.g. {"enable_thinking": true}
+
+
+class DemoLoadRequest(_Lenient):
+    count: int = 1
+    max_tokens: int = 96
+    shared_prefix: bool = True
+    temperature: float = 0.7
+
+
+DEMO_SYSTEM = (
+    "You are a helpful assistant for an outdoor gear store. Answer clearly and briefly. Orders ship in two "
+    "business days; returns are accepted within sixty days for unused items; warranties cover defects for one "
+    "year on tents and backpacks and two years on stoves and headlamps. Always be friendly and end by asking "
+    "if there is anything else you can help with.\n\nCustomer question: "
+)
+DEMO_QUESTIONS = [
+    "Explain how a CPU cache works.", "Write a haiku about the ocean.", "What causes the seasons on Earth?",
+    "Give three tips for writing clean code.", "How does a hash table handle collisions?",
+    "Describe photosynthesis in simple terms.", "Why is the sky blue?", "What is a KV cache in an LLM?",
+    "Summarize the plot of a heist movie.", "How do vaccines train the immune system?",
+    "What is the difference between TCP and UDP?", "Write a limerick about a cat.",
+]
+demo_counter = itertools.count()
 
 
 # ---------------------------------------------------------------------------- helpers
@@ -280,6 +306,31 @@ def create_app(async_engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI
                          "logprobs": None, "finish_reason": finish}],
             "usage": usage,
         }
+
+    # ------------------------------------------------------------ demo load for the dashboard
+    # Browsers allow only ~6 open connections per server, so a load generator running in the
+    # page can never have more than 6 requests in flight. This endpoint lets the dashboard ask
+    # the server to start N requests itself; it returns immediately.
+
+    background: set[asyncio.Task] = set()
+
+    async def _demo_one(prompt: str, params: SamplingParams) -> None:
+        async for _ in async_engine.generate(tokenizer(prompt)["input_ids"], params):
+            pass
+
+    @app.post("/v1/demo/load")
+    async def demo_load(body: DemoLoadRequest):
+        n = max(0, min(body.count, 500))
+        for _ in range(n):
+            q = DEMO_QUESTIONS[next(demo_counter) % len(DEMO_QUESTIONS)]
+            prompt = (DEMO_SYSTEM if body.shared_prefix else "") + q + "\nAnswer:"
+            max_tokens = max(8, round(body.max_tokens * random.uniform(0.4, 1.0)))
+            params = SamplingParams(max_new_tokens=min(max_tokens, async_engine.max_request_len - 256),
+                                    temperature=body.temperature, top_p=0.95)
+            task = asyncio.create_task(_demo_one(prompt, params))
+            background.add(task)
+            task.add_done_callback(background.discard)
+        return {"queued": n, "in_flight": len(background)}
 
     # ------------------------------------------------------------ live events for the dashboard
 

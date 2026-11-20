@@ -119,3 +119,17 @@ def test_stats_and_events_ws(http):
     assert {"request_arrived", "request_started", "step", "request_finished"} <= types
     s = http.get("/v1/stats").json()
     assert s["running"] == 0 and s["kv_used"] == 0 and s["total_requests"] > 0
+
+
+def test_demo_load_starts_requests_server_side(http):
+    import time
+
+    r = http.post("/v1/demo/load", json={"count": 5, "max_tokens": 8, "shared_prefix": True})
+    assert r.status_code == 200 and r.json()["queued"] == 5
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        s = http.get("/v1/stats").json()
+        if s["running"] == 0 and s["waiting"] == 0 and s["total_requests"] >= 5:
+            break
+        time.sleep(0.2)
+    assert s["running"] == 0 and s["kv_used"] == 0

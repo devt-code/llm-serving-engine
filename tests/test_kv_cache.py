@@ -204,3 +204,27 @@ def test_paged_fits_more_requests_than_slots_in_same_memory(our_model, prompts):
     slot_eng.generate(prompts, sp)
     paged_eng.generate(prompts, sp)
     assert paged_eng.peak_running > 2 * slot_eng.peak_running
+
+
+@pytest.mark.needs_model
+@torch.inference_mode()
+def test_length_grouped_decode_matches_single_group(our_model, tokenizer):
+    """Decode attention split into length groups must give the same logits as one padded batch."""
+    from engine.kv_cache import PagedAttentionBatch
+
+    eng = LLMEngine(our_model, max_num_seqs=32, max_model_len=256, max_num_batched_tokens=4096,
+                    kv_cache="paged", num_kv_blocks=1024, block_size=4, enable_prefix_caching=False)
+    seqs = [tokenizer(p * (1 + 6 * (i % 3 == 0)))["input_ids"][:200] for i, p in enumerate(PROMPTS)]
+    reqs = [eng.add_request(s, SamplingParams(max_new_tokens=4)) for s in seqs]
+    eng.step()
+    for r in reqs:
+        assert eng.memory.ensure_capacity(r, r.num_computed + 1)
+    ctx = [r.num_computed + 1 for r in reqs]
+    ids = torch.tensor([r.last_token for r in reqs])
+    pos = torch.tensor([r.num_computed for r in reqs])
+    grouped = PagedAttentionBatch(eng.cache, [r.block_table for r in reqs], [1] * len(reqs), ctx)
+    assert grouped.groups is not None, "mixed lengths should trigger grouping"
+    single = PagedAttentionBatch(eng.cache, [r.block_table for r in reqs], [1] * len(reqs), ctx)
+    single.groups = None
+    a, b = our_model(ids, pos, grouped), our_model(ids, pos, single)
+    assert torch.allclose(a, b, atol=1e-4)

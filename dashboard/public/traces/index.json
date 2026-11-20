@@ -1,0 +1,12 @@
+[
+  {
+    "file": "mixed.jsonl",
+    "title": "Steady traffic with a shared system prompt",
+    "description": "About 4 requests per second for 40 seconds. Half share a long system prompt, so its blocks are computed once and reused by every request that starts with it (aqua squares). Watch requests join and leave the batch at every step, and cached blocks stay after their requests finish."
+  },
+  {
+    "file": "pressure.jsonl",
+    "title": "Burst into a small KV cache (preemption)",
+    "description": "96 requests arrive at once into a cache that can't hold them all. The scheduler admits what fits, then preempts the newest requests (orange) when blocks run out, and recomputes them later. No request's output changes; only its timing does."
+  }
+]

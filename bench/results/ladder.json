@@ -1,0 +1,82 @@
+{
+  "timestamp": "2026-11-20T14:05:18",
+  "device": "mps",
+  "gpu": "arm",
+  "dtype": "bfloat16",
+  "machine": "macOS-26.6.2-arm64-arm-64bit",
+  "torch": "2.15.0",
+  "workload": {
+    "num_requests": 256,
+    "output_tokens": 36044,
+    "kv_budget_gb": 2.41
+  },
+  "results": [
+    {
+      "config": "hf",
+      "label": "HF transformers (static batches)",
+      "total_s": 205.0,
+      "output_tokens": 36044,
+      "output_tok_per_s": 175.8,
+      "note": "TTFT not observable inside generate()",
+      "e2e_p50_s": 130.48,
+      "e2e_p99_s": 205.0
+    },
+    {
+      "config": "static",
+      "label": "Ours: static batching",
+      "total_s": 143.43,
+      "output_tokens": 36044,
+      "output_tok_per_s": 251.3,
+      "kv_cache_gb": 2.41,
+      "peak_running": 32,
+      "preemptions": 0,
+      "ttft_p50_s": 79.898,
+      "ttft_p99_s": 130.385,
+      "e2e_p50_s": 82.73,
+      "e2e_p99_s": 141.78
+    },
+    {
+      "config": "continuous",
+      "label": "Ours: continuous batching",
+      "total_s": 92.9,
+      "output_tokens": 36044,
+      "output_tok_per_s": 388.0,
+      "kv_cache_gb": 2.41,
+      "peak_running": 32,
+      "preemptions": 0,
+      "ttft_p50_s": 40.168,
+      "ttft_p99_s": 82.677,
+      "e2e_p50_s": 50.22,
+      "e2e_p99_s": 91.0
+    },
+    {
+      "config": "paged",
+      "label": "Ours: + paged KV cache",
+      "total_s": 102.87,
+      "output_tokens": 36044,
+      "output_tok_per_s": 350.4,
+      "kv_cache_gb": 2.41,
+      "peak_running": 94,
+      "preemptions": 48,
+      "ttft_p50_s": 42.982,
+      "ttft_p99_s": 86.399,
+      "e2e_p50_s": 64.75,
+      "e2e_p99_s": 102.03
+    },
+    {
+      "config": "prefix",
+      "label": "Ours: + prefix caching",
+      "total_s": 64.56,
+      "output_tokens": 36044,
+      "output_tok_per_s": 558.3,
+      "kv_cache_gb": 2.41,
+      "peak_running": 256,
+      "preemptions": 85,
+      "prefix_hit_rate": 0.8877,
+      "ttft_p50_s": 2.906,
+      "ttft_p99_s": 2.907,
+      "e2e_p50_s": 47.1,
+      "e2e_p99_s": 63.28
+    }
+  ]
+}

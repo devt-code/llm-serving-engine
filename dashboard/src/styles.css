@@ -132,6 +132,14 @@ button, input, select { font: inherit; color: inherit; }
 .scrub input[type="range"] { flex: 1; width: auto; }
 .mono { font-variant-numeric: tabular-nums; }
 
+.notice { margin-bottom: 14px; }
+.notice p { margin: 6px 0; color: var(--text-secondary); }
+.notice pre {
+  background: var(--surface-2); border-radius: 8px; padding: 10px 12px; margin: 8px 0;
+  font-size: 12.5px; line-height: 1.5; overflow-x: auto; white-space: pre;
+}
+.notice a { color: var(--series-1); }
+
 .empty { color: var(--text-muted); padding: 28px 0; text-align: center; font-size: 13px; }
 .footer { margin-top: 18px; color: var(--text-muted); font-size: 12px; }
 .footer a { color: var(--text-secondary); }

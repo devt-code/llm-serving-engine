@@ -160,8 +160,28 @@ function LiveControls({ server, setServer, live }: {
     idle: "Not connected", connecting: "Connecting…", open: `Connected${live.servedModel ? ` · ${live.servedModel}` : ""}`,
     closed: "Disconnected", error: "Can't reach the server. Is `python -m server.api` running?",
   }[live.status];
+  // A page served from the public internet can't open connections to localhost (browsers block
+  // public sites from reaching the local network). Live mode needs the dashboard served locally.
+  const hosted = !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+  const failed = live.status === "error" || live.status === "closed";
   return (
-    <div className="controls">
+    <>
+    {hosted && live.status !== "open" && (
+      <div className="card notice">
+        <h2>Live mode runs on your own computer</h2>
+        <p>
+          This page is hosted on the web, and browsers don't let a website connect to programs on your machine. To watch
+          the engine live, run the engine and this dashboard locally (Python 3.11 and Node 18+, about 4 GB):
+        </p>
+        <pre>{`git clone ${REPO}.git && cd llm-serving-engine
+python3.11 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-0.6B', local_dir='models/qwen3-0.6b')"
+python -m server.api                      # terminal 1
+cd dashboard && npm install && npx vite   # terminal 2`}</pre>
+        <p>Then open <a href="http://localhost:5173/?live">http://localhost:5173/?live</a>. Or switch to <b>Replay a recorded run</b> above: it shows a real recorded run, no setup needed.</p>
+      </div>
+    )}
+    <div className="controls" style={hosted && failed ? { opacity: 0.55 } : undefined}>
       <label>Server
         <input type="text" value={draft} onChange={(e) => setDraft(e.target.value)}
                onKeyDown={(e) => e.key === "Enter" && setServer(draft)} onBlur={() => setServer(draft)} />
@@ -182,5 +202,6 @@ function LiveControls({ server, setServer, live }: {
         {load.sent} sent{load.errors ? ` · ${load.errors} errors` : ""}
       </span>
     </div>
+    </>
   );
 }

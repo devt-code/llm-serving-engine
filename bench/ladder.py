@@ -6,6 +6,7 @@
     paged       + paged KV cache (same KV memory as the slot cache)
     prefix      + prefix caching
     vllm        vLLM, same settings (only where vLLM is installed, i.e. Linux + NVIDIA GPU)
+    vllm_kv     vLLM with its KV cache capped at the same budget our engine gets
 
 Workload: --num-requests chat requests arriving at once. Half share a ~380-token system prompt
 (like an app's built-in instructions), half are short standalone questions. Output lengths
@@ -21,6 +22,7 @@ needs; the paged runs get the same bytes.
 import argparse
 import gc
 import json
+import os
 import platform
 import random
 import sys
@@ -35,7 +37,8 @@ from bench.batching import pct  # noqa: E402
 from bench.prefix import QUESTIONS, SYSTEM  # noqa: E402
 from tests.prompts import PROMPTS  # noqa: E402
 
-LADDER = ["hf", "static", "continuous", "paged", "prefix", "vllm"]
+LADDER = ["hf", "static", "continuous", "paged", "prefix", "vllm", "vllm_kv"]
+VLLM = ("vllm", "vllm_kv")
 LABELS = {
     "hf": "HF transformers (static batches)",
     "static": "Ours: static batching",
@@ -43,6 +46,7 @@ LABELS = {
     "paged": "Ours: + paged KV cache",
     "prefix": "Ours: + prefix caching",
     "vllm": "vLLM",
+    "vllm_kv": "vLLM, same KV memory as ours",
 }
 
 
@@ -159,21 +163,31 @@ def run_ours(name, args, model, prompts, lens):
 # ------------------------------------------------------------------ vLLM
 
 
-def run_vllm(args, prompts, lens, kv_gb):
+def run_vllm(name, args, prompts, lens, kv_bytes):
+    """vllm: vLLM sizes its own KV cache from --vllm-gpu-util. vllm_kv: capped at our KV budget."""
+    # vLLM runs its engine in a child process. Forking one after CUDA has started fails with
+    # "Cannot re-initialize CUDA in forked subprocess" (seen on Colab with vLLM 0.34), so spawn it.
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     from vllm import LLM, SamplingParams as VSP  # noqa: N814
     from vllm.inputs import TokensPrompt
 
     max_len = max(len(p) for p in prompts) + max(lens)
-    llm = LLM(model=args.model, dtype=args.dtype, max_model_len=max_len, enable_prefix_caching=True,
-              gpu_memory_utilization=args.vllm_gpu_util, seed=0)
+    kw = dict(model=args.model, dtype=args.dtype, max_model_len=max_len, enable_prefix_caching=True, seed=0)
+    if name == "vllm_kv":
+        kw["kv_cache_memory_bytes"] = kv_bytes
+        note = f"vLLM offline LLM.generate, prefix caching on, KV cache capped at our {kv_bytes / 1e9:.2f} GB"
+    else:
+        kw["gpu_memory_utilization"] = args.vllm_gpu_util
+        note = (f"vLLM offline LLM.generate, prefix caching on, gpu_memory_utilization={args.vllm_gpu_util} "
+                f"(vLLM sizes its own KV cache); our KV budget was {kv_bytes / 1e9:.2f} GB")
+    llm = LLM(**kw)
     inputs = [TokensPrompt(prompt_token_ids=p) for p in prompts]
     params = [VSP(max_tokens=n, min_tokens=n, ignore_eos=True, temperature=0.0) for n in lens]
     llm.generate(inputs[:8], params[:8], use_tqdm=False)  # warmup
     t0 = time.perf_counter()
     llm.generate(inputs, params, use_tqdm=False)
     total = time.perf_counter() - t0
-    return result("vllm", total, lens, note=f"vLLM offline LLM.generate, prefix caching on; our KV budget was {kv_gb} GB, "
-                                            f"vLLM used gpu_memory_utilization={args.vllm_gpu_util}")
+    return result(name, total, lens, note=note)
 
 
 def main():
@@ -200,16 +214,17 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.model)
     prompts, lens = build_workload(tok, args.num_requests)
     todo = args.only.split(",") if args.only else LADDER
-    if "vllm" in todo:
+    if any(t in VLLM for t in todo):
         try:
             import vllm  # noqa: F401
         except ImportError:
             print("vllm not installed here, skipping (it needs Linux + an NVIDIA GPU)")
-            todo = [t for t in todo if t != "vllm"]
+            todo = [t for t in todo if t not in VLLM]
     max_len = max(len(p) for p in prompts) + max(lens)
     from engine.config import Qwen3Config
 
-    kv_gb = args.slots * max_len // 16 * PagedKVCache.bytes_per_block(Qwen3Config.from_pretrained(args.model), 16, dtype) / 1e9
+    kv_bytes = args.slots * max_len // 16 * PagedKVCache.bytes_per_block(Qwen3Config.from_pretrained(args.model), 16, dtype)
+    kv_gb = kv_bytes / 1e9
     print(f"{len(prompts)} requests (half with a {len(prompts[0])}-token shared-system-prompt chat, half short), "
           f"outputs 16-256 ({sum(lens)} tokens), {device} {args.dtype}, KV budget {kv_gb:.2f} GB")
 
@@ -220,12 +235,12 @@ def main():
     for name in [n for n in LADDER if n in todo]:
         if name == "hf":
             r = run_hf(args, device, dtype, prompts, lens)
-        elif name == "vllm":
+        elif name in VLLM:
             if model is not None:
                 del model
                 model = None
                 free(device)
-            r = run_vllm(args, prompts, lens, round(kv_gb, 2))
+            r = run_vllm(name, args, prompts, lens, kv_bytes)
         else:
             if model is None:
                 model = load_model(args.model, device=device, dtype=dtype)

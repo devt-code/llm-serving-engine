@@ -1,0 +1,100 @@
+{
+  "timestamp": "2026-11-22T23:46:31",
+  "device": "cuda",
+  "gpu": "NVIDIA L4",
+  "dtype": "bfloat16",
+  "machine": "Linux-6.6.159+-x86_64-with-glibc2.39",
+  "torch": "2.14.0+cu130",
+  "workload": {
+    "num_requests": 256,
+    "output_tokens": 36044,
+    "kv_budget_gb": 2.41
+  },
+  "results": [
+    {
+      "config": "hf",
+      "label": "HF transformers (static batches)",
+      "total_s": 143.38,
+      "output_tokens": 36044,
+      "output_tok_per_s": 251.4,
+      "note": "TTFT not observable inside generate()",
+      "e2e_p50_s": 89.29,
+      "e2e_p99_s": 143.38
+    },
+    {
+      "config": "static",
+      "label": "Ours: static batching",
+      "total_s": 68.4,
+      "output_tokens": 36044,
+      "output_tok_per_s": 526.9,
+      "kv_cache_gb": 2.41,
+      "peak_running": 32,
+      "preemptions": 0,
+      "ttft_p50_s": 34.435,
+      "ttft_p99_s": 60.194,
+      "e2e_p50_s": 35.36,
+      "e2e_p99_s": 67.52
+    },
+    {
+      "config": "continuous",
+      "label": "Ours: continuous batching",
+      "total_s": 47.32,
+      "output_tokens": 36044,
+      "output_tok_per_s": 761.7,
+      "kv_cache_gb": 2.41,
+      "peak_running": 32,
+      "preemptions": 0,
+      "ttft_p50_s": 18.989,
+      "ttft_p99_s": 39.871,
+      "e2e_p50_s": 23.95,
+      "e2e_p99_s": 45.22
+    },
+    {
+      "config": "paged",
+      "label": "Ours: + paged KV cache",
+      "total_s": 38.32,
+      "output_tokens": 36044,
+      "output_tok_per_s": 940.7,
+      "kv_cache_gb": 2.41,
+      "peak_running": 94,
+      "preemptions": 48,
+      "ttft_p50_s": 14.04,
+      "ttft_p99_s": 28.022,
+      "e2e_p50_s": 21.23,
+      "e2e_p99_s": 37.23
+    },
+    {
+      "config": "prefix",
+      "label": "Ours: + prefix caching",
+      "total_s": 26.56,
+      "output_tokens": 36044,
+      "output_tok_per_s": 1357.3,
+      "kv_cache_gb": 2.41,
+      "peak_running": 256,
+      "preemptions": 85,
+      "prefix_hit_rate": 0.8877,
+      "ttft_p50_s": 0.395,
+      "ttft_p99_s": 0.395,
+      "e2e_p50_s": 17.86,
+      "e2e_p99_s": 24.95
+    },
+    {
+      "config": "vllm",
+      "label": "vLLM",
+      "total_s": 5.05,
+      "output_tokens": 36044,
+      "output_tok_per_s": 7135.6,
+      "note": "vLLM offline LLM.generate, prefix caching on, gpu_memory_utilization=0.5 (vLLM sizes its own KV cache); our KV budget was 2.41 GB",
+      "vllm_version": "0.34.0"
+    },
+    {
+      "config": "vllm_kv",
+      "label": "vLLM, same KV memory as ours",
+      "total_s": 6.09,
+      "output_tokens": 36044,
+      "output_tok_per_s": 5914.2,
+      "note": "vLLM offline LLM.generate, prefix caching on, KV cache capped at our 2.41 GB",
+      "vllm_version": "0.34.0"
+    }
+  ]
+}

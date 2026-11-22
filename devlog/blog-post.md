@@ -99,6 +99,28 @@ length and attending in a few groups won back most of it (281 → 350 tok/s), bu
 because paging also brought 48 preemptions. What paging buys is room: it's what lets prefix caching keep 256
 requests in flight.
 
+## Against vLLM
+
+The same ladder on an NVIDIA L4, bf16, plus vLLM 0.34 with prefix caching on, run twice: once with
+the KV memory it picks for itself, and once capped at the 2.41 GB my engine gets.
+
+| | Throughput |
+|---|---:|
+| Hugging Face `generate()` | 251 tok/s |
+| My engine, with prefix caching | 1,357 tok/s |
+| vLLM, same KV memory | 5,914 tok/s |
+| vLLM, its default memory | 7,136 tok/s |
+
+That's 5.4× Hugging Face and 23% of vLLM at equal memory. The gap is what I deliberately didn't
+build. vLLM captures CUDA graphs and compiles the model, while my engine issues about 1,500 small
+kernels per step from Python. Its attention kernels read KV blocks in place, while mine gathers them
+into padded tensors first. And it mixes chunks of new prompts into decode steps.
+
+Two surprises. Paging alone was a clear win on the L4 (762 → 941 tok/s) after being slightly slower
+on the Mac: there, running 94 requests instead of 32 outweighs the cost of gathering blocks. And getting vLLM to run
+on Colab took two fixes: removing a preinstalled torchaudio built for a different CUDA version, and
+starting vLLM's engine process with spawn, because forking it after CUDA had started failed.
+
 ## Things I didn't expect
 
 - **Batching changes outputs, slightly.** In fp32, a request's output is identical whether it runs
@@ -121,9 +143,9 @@ few steps and are preempted again, which I would never have noticed in the numbe
 
 ## What's next
 
-- A head-to-head against vLLM on an NVIDIA GPU (the notebook is in the repo).
+- CUDA graphs for decode steps, to cut the per-step launch overhead.
 - Chunked prefill, so new requests stop pausing everyone else's decoding.
-- An upstream contribution to vLLM in the KV-cache code.
+- An upstream contribution in the vLLM ecosystem; the candidates are in the repo's dev log.
 
 If you want to read the code, start with `engine/scheduler.py` and `engine/kv_cache.py`. The dev logs
 in the repo have every measurement and every wrong turn.

@@ -7,9 +7,11 @@ what the engine is doing.
 
 **[▶ Watch a recorded run in the dashboard](https://devt-code.github.io/llm-serving-engine/)**, no GPU needed.
 
-- **3.2× the throughput of Hugging Face `generate()`** on the same model, GPU and workload
-  (558 vs 176 tok/s), and **median time to first token cut from 80 s to 2.9 s** under load
-  compared with static batching.
+- **3.2× the throughput of Hugging Face `generate()`** on an Apple M3 Pro, same model and
+  workload (558 vs 176 tok/s), and **median time to first token cut from 80 s to 2.9 s** under
+  load compared with static batching.
+- **On an NVIDIA L4: 1,357 tok/s, 5.4× Hugging Face and 23% of vLLM's throughput** with the
+  same KV memory (19% of vLLM at its default memory settings). [Details](#against-vllm-on-an-nvidia-gpu).
 - **2.6× more requests running at once in the same GPU memory**, thanks to the paged KV cache.
 - **Median time to first token drops from 7.2 s to 29 ms** at 6 requests per second when requests share a
   system prompt, thanks to prefix caching (96% of prompt tokens reused).
@@ -21,8 +23,8 @@ Every number here is measured and reproducible with the scripts in [`bench/`](be
 
 ## Results
 
-All on an Apple M3 Pro GPU (MPS), bf16, Qwen3-0.6B. vLLM comparison on an NVIDIA GPU: see
-[Benchmark against vLLM](#benchmark-against-vllm).
+On an Apple M3 Pro GPU (MPS), bf16, Qwen3-0.6B, except the vLLM comparison, which needs an
+NVIDIA GPU: see [Against vLLM on an NVIDIA GPU](#against-vllm-on-an-nvidia-gpu).
 
 ### One optimization at a time
 
@@ -48,6 +50,37 @@ It runs ~3× more requests at once, but pays for it with 48 preemptions and with
 request's blocks in plain PyTorch (vLLM fuses that gather into a custom kernel). The memory it frees
 is what lets prefix caching keep 256 requests in flight. On a workload of short prompts, paging alone
 is a clear win; see below.
+
+### Against vLLM on an NVIDIA GPU
+
+The same ladder on an NVIDIA L4 (Colab), bf16, with both engines on PyTorch 2.14, plus vLLM 0.34
+run twice: once with the KV memory it sizes for itself, once capped at our engine's 2.41 GB.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/gpu-vs-vllm-dark.png">
+  <img alt="On an L4: HF 251, static 527, continuous 762, paged 941, prefix caching 1,357, vLLM at equal memory 5,914, vLLM at default memory 7,136 tok/s" src="docs/gpu-vs-vllm-light.png">
+</picture>
+
+| Configuration | Throughput | Median TTFT | Peak running |
+|---|---:|---:|---:|
+| Hugging Face `generate()`, static batches of 32 | 251 tok/s | — | 32 |
+| Ours: static batching | 527 tok/s | 34.4 s | 32 |
+| Ours: continuous batching | 762 tok/s | 19.0 s | 32 |
+| Ours: + paged KV cache | 941 tok/s | 14.0 s | 94 |
+| Ours: + prefix caching | **1,357 tok/s** | **0.40 s** | 256 |
+| vLLM, same KV memory as ours (19,590 tokens) | 5,914 tok/s | — | — |
+| vLLM, default memory (75,495 tokens) | 7,136 tok/s | — | — |
+
+Our best configuration is **5.4× Hugging Face and 23% of vLLM** at equal KV memory. vLLM's lead
+comes from what this engine leaves out on purpose: CUDA graphs and `torch.compile` instead of eager
+PyTorch (about 1,500 kernel launches per decode step, counted in the dev logs), fused attention kernels that read KV
+blocks in place instead of gathering them into padded tensors, and chunked prefill, which mixes new
+prompts into decode steps. vLLM ran offline (`LLM.generate`), so its time to first token isn't
+measured.
+
+Paging behaves differently on CUDA. On the L4 it is a clear win on its own (762 → 941 tok/s):
+running 94 requests instead of 32 outweighs the cost of gathering blocks, which on Apple's GPU made
+paging 10% slower. Raw numbers: [`bench/results/ladder_gpu.json`](bench/results/ladder_gpu.json).
 
 ### Paged KV cache: more requests in the same memory
 
@@ -188,13 +221,13 @@ pytest
 - run the block manager's bookkeeping with no leaked blocks;
 - drive the server with the official `openai` client.
 
-Two CUDA tests run on NVIDIA GPUs only.
+Two CUDA tests run on NVIDIA GPUs only; both pass on an L4.
 
 ## Benchmarks
 
 | Script | What it measures |
 |---|---|
-| `bench/ladder.py` | The comparison ladder above (add `--only vllm` on an NVIDIA GPU) |
+| `bench/ladder.py` | The comparison ladder above (`--only vllm` and `--only vllm_kv` on an NVIDIA GPU) |
 | `bench/batching.py` | Static vs continuous batching |
 | `bench/paged.py` | Slot vs paged cache at equal memory, concurrency sweep |
 | `bench/prefix.py` | Shared-system-prompt workload, burst and Poisson arrivals |
@@ -205,8 +238,8 @@ Two CUDA tests run on NVIDIA GPUs only.
 ### Benchmark against vLLM
 
 [`notebooks/benchmark_vs_vllm.ipynb`](notebooks/benchmark_vs_vllm.ipynb) runs the whole ladder
-plus vLLM on one NVIDIA GPU (free on Kaggle or Colab). It needs Linux and CUDA, so those
-numbers aren't in this README yet.
+plus both vLLM runs on one NVIDIA GPU (Colab or Kaggle) and the two CUDA tests. The L4 numbers
+above came from it, in under half an hour.
 
 ## Project layout
 
@@ -224,5 +257,6 @@ devlog/      build notes, results and profiling for each stage
 ## Limits
 
 This engine is for learning and measurement, not production: one GPU, one model family, and attention
-written in plain PyTorch (no custom kernels, no CUDA graphs). Very high concurrency on a
+written in plain PyTorch (no custom kernels, no CUDA graphs), which is why it reaches about a quarter
+of vLLM's throughput on the same GPU. Very high concurrency on a
 small pool causes preemption thrashing, which the dashboard's memory-pressure recording shows.

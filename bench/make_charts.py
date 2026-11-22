@@ -33,12 +33,14 @@ def style(ax, t):
     ax.set_axisbelow(True)
 
 
-def hbar(name, title, subtitle, labels, values, fmt, t, highlight=None, xlabel=""):
+def hbar(name, title, subtitle, labels, values, fmt, t, highlight=None, xlabel="", accent=()):
+    """highlight: indices drawn in the main color (others dimmed); accent: indices in the second color."""
     fig, ax = plt.subplots(figsize=(7.2, 0.42 * len(labels) + 1.35), dpi=160)
     fig.patch.set_facecolor(t["surface"])
     style(ax, t)
     y = range(len(labels))[::-1]
-    colors = [t["s1"] if (highlight is None or i in highlight) else t["dim"] for i in range(len(labels))]
+    colors = [t["s2"] if i in accent else t["s1"] if (highlight is None or i in highlight) else t["dim"]
+              for i in range(len(labels))]
     bars = ax.barh(list(y), values, color=colors, height=0.62)
     for bar, v in zip(bars, values):
         ax.text(bar.get_width() + max(values) * 0.01, bar.get_y() + bar.get_height() / 2, fmt(v),
@@ -82,6 +84,27 @@ def main():
                           lambda v: f"{v:.2f} s", t, highlight={len(ttft_rows) - 1}),
                      "ladder-ttft", mode)
         made += ["ladder-throughput", "ladder-ttft"]
+
+    gpu = RES / "ladder_gpu.json"
+    if gpu.exists():
+        d = json.loads(gpu.read_text())
+        rows = d["results"]
+        names = {"vllm": "vLLM, default memory", "vllm_kv": "vLLM, same KV memory as ours"}
+        ours = [i for i, r in enumerate(rows) if r["config"] in ("static", "continuous", "paged", "prefix")]
+        best = max(ours, key=lambda i: rows[i]["output_tok_per_s"])
+        vllm = {i for i, r in enumerate(rows) if r["config"] in names}
+        same = next((r for r in rows if r["config"] == "vllm_kv"), None)
+        version = next((r["vllm_version"] for r in rows if "vllm_version" in r), None)
+        title = (f"On an {d['gpu'].removeprefix('NVIDIA ')}, our best is "
+                 f"{100 * rows[best]['output_tok_per_s'] / same['output_tok_per_s']:.0f}% of vLLM at equal memory"
+                 if same else f"Our engine and vLLM on an {d['gpu']}")
+        sub = (f"{d['workload']['num_requests']} requests, {d['workload']['output_tokens']:,} output tokens, {d['dtype']}"
+               + (f", vLLM {version}" if version else "") + f". Our configs get {d['workload']['kv_budget_gb']} GB of KV memory.")
+        for mode, t in THEMES.items():
+            save(hbar("gpu", title, sub, [names.get(r["config"], r["label"]) for r in rows],
+                      [r["output_tok_per_s"] for r in rows], lambda v: f"{v:,.0f} tok/s", t,
+                      highlight={best}, accent=vllm), "gpu-vs-vllm", mode)
+        made.append("gpu-vs-vllm")
 
     paged = RES / "paged.json"
     if paged.exists():

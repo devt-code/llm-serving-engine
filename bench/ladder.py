@@ -45,7 +45,7 @@ LABELS = {
     "continuous": "Ours: continuous batching",
     "paged": "Ours: + paged KV cache",
     "prefix": "Ours: + prefix caching",
-    "vllm": "vLLM",
+    "vllm": "vLLM, default memory",
     "vllm_kv": "vLLM, same KV memory as ours",
 }
 
@@ -168,7 +168,7 @@ def run_vllm(name, args, prompts, lens, kv_bytes):
     # vLLM runs its engine in a child process. Forking one after CUDA has started fails with
     # "Cannot re-initialize CUDA in forked subprocess" (seen on Colab with vLLM 0.34), so spawn it.
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    from vllm import LLM, SamplingParams as VSP  # noqa: N814
+    from vllm import LLM, SamplingParams as VSP, __version__ as vllm_version  # noqa: N814
     from vllm.inputs import TokensPrompt
 
     max_len = max(len(p) for p in prompts) + max(lens)
@@ -187,7 +187,7 @@ def run_vllm(name, args, prompts, lens, kv_bytes):
     t0 = time.perf_counter()
     llm.generate(inputs, params, use_tqdm=False)
     total = time.perf_counter() - t0
-    return result(name, total, lens, note=note)
+    return result(name, total, lens, note=note, vllm_version=vllm_version)
 
 
 def main():

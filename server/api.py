@@ -268,7 +268,7 @@ def create_app(async_engine: AsyncEngine, tokenizer, model_name: str, *, max_tok
         if body.stream:
             async def events() -> AsyncIterator[str]:
                 usage = None
-                async for out in _run(async_engine.generate(prompt_ids, params), detok, request):
+                async for out in _run(async_engine.generate(prompt_ids, params, request_id=rid), detok, request):
                     delta, done = out
                     if delta or done is not None:
                         yield _sse(chunk(delta, done[0] if done else None))
@@ -280,7 +280,7 @@ def create_app(async_engine: AsyncEngine, tokenizer, model_name: str, *, max_tok
                 yield _sse("[DONE]")
             return StreamingResponse(events(), media_type="text/event-stream")
 
-        text, finish, usage = await _collect(async_engine.generate(prompt_ids, params), detok, request)
+        text, finish, usage = await _collect(async_engine.generate(prompt_ids, params, request_id=rid), detok, request)
         if finish is None:
             return openai_error(499, "client disconnected")
         resp = chunk(text, finish)
@@ -314,7 +314,7 @@ def create_app(async_engine: AsyncEngine, tokenizer, model_name: str, *, max_tok
             async def events() -> AsyncIterator[str]:
                 yield _sse(chunk({"role": "assistant", "content": ""}, None))
                 usage = None
-                async for delta, done in _run(async_engine.generate(prompt_ids, params), detok, request):
+                async for delta, done in _run(async_engine.generate(prompt_ids, params, request_id=rid), detok, request):
                     if delta:
                         yield _sse(chunk({"content": delta}, None))
                     if done:
@@ -326,7 +326,7 @@ def create_app(async_engine: AsyncEngine, tokenizer, model_name: str, *, max_tok
                 yield _sse("[DONE]")
             return StreamingResponse(events(), media_type="text/event-stream")
 
-        content, finish, usage = await _collect(async_engine.generate(prompt_ids, params), detok, request)
+        content, finish, usage = await _collect(async_engine.generate(prompt_ids, params, request_id=rid), detok, request)
         if finish is None:
             return openai_error(499, "client disconnected")
         return {

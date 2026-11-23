@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { AskBox } from "./components/AskBox";
 import { BlockMap } from "./components/BlockMap";
 import { KvChart, QueueChart, ThroughputChart } from "./components/Charts";
 import { RequestLanes } from "./components/RequestLanes";
@@ -23,6 +24,7 @@ export default function App() {
   const replay = useReplay();
   const [traces, setTraces] = useState<TraceInfo[]>([]);
   const [trace, setTrace] = useState("");
+  const [mine, setMine] = useState(""); // id of the visitor's latest prompt, marked in the timeline
 
   useEffect(() => {
     fetch("traces/index.json")
@@ -61,11 +63,11 @@ export default function App() {
       </header>
 
       {mode === "replay" ? <ReplayControls replay={replay} traces={traces} trace={trace} setTrace={setTrace} />
-                         : <LiveControls server={server} setServer={setServer} live={live} />}
+                         : <LiveControls server={server} setServer={setServer} live={live} onRequest={setMine} />}
       {mode === "replay" && info && <p className="hint" style={{ marginTop: -6, marginBottom: 12, color: "var(--text-secondary)" }}>{info.description}</p>}
       {mode === "replay" && replay.error && <p className="hint" style={{ color: "var(--critical)" }}>{replay.error}</p>}
 
-      <Panels model={model} version={version} theme={theme} />
+      <Panels model={model} version={version} theme={theme} highlight={mode === "live" ? mine : ""} />
 
       <div className="footer">
         Every panel is rebuilt from the engine's event stream: request arrivals, scheduler steps, KV block
@@ -75,7 +77,9 @@ export default function App() {
   );
 }
 
-function Panels({ model, version, theme }: { model: EngineModel; version: number; theme: ReturnType<typeof useTheme> }) {
+function Panels({ model, version, theme, highlight }: {
+  model: EngineModel; version: number; theme: ReturnType<typeof useTheme>; highlight: string;
+}) {
   const data = model.series(0.5, 60);
   return (
     <>
@@ -84,7 +88,7 @@ function Panels({ model, version, theme }: { model: EngineModel; version: number
         <section className="card">
           <h2>Requests in the batch</h2>
           <p className="hint">Each row is a request. With continuous batching, requests join and leave at every step.</p>
-          <RequestLanes model={model} theme={theme} version={version} />
+          <RequestLanes model={model} theme={theme} version={version} highlight={highlight} />
         </section>
         <section className="card">
           <h2>KV cache blocks</h2>
@@ -151,8 +155,8 @@ function ReplayControls({ replay, traces, trace, setTrace }: {
   );
 }
 
-function LiveControls({ server, setServer, live }: {
-  server: string; setServer: (s: string) => void; live: ReturnType<typeof useLive>;
+function LiveControls({ server, setServer, live, onRequest }: {
+  server: string; setServer: (s: string) => void; live: ReturnType<typeof useLive>; onRequest: (id: string) => void;
 }) {
   const [draft, setDraft] = useState(server);
   const load = useLoadGenerator(server);
@@ -234,15 +238,26 @@ cd dashboard && npm install && npx vite   # terminal 2`}</pre>
         {load.sent} sent{load.errors ? ` · ${load.errors} errors` : ""}{stopped && rate === 0 ? ` · load ${stopped}` : ""}
       </span>
     </div>
-    {SAME_ORIGIN && (
+    {SAME_ORIGIN && live.status === "closed" && live.closeReason === "idle" && (
       <p className="hint" style={{ marginTop: -6, marginBottom: 12, color: "var(--text-secondary)" }}>
-        {live.status === "closed" && live.closeReason === "idle"
-          ? "Disconnected after a couple of quiet minutes, so the server can shut down while nobody is using it. Reload the page to reconnect."
-          : `Running on ${live.device || "a shared server"}${/CPU/.test(live.device)
-              ? ", so each request gets a few tokens per second; on a GPU the same engine is far faster" : ""}. `
-            + "Everyone with this page open watches the same engine."}
+        Disconnected after a couple of quiet minutes, so the server can shut down while nobody is using it. Reload the
+        page to reconnect.
       </p>
     )}
+    {live.status === "open" && (/CPU/.test(live.device) ? (
+      // The live numbers on a CPU are far below the GPU benchmarks; say so where the numbers are.
+      <div className="callout">
+        <b>This copy runs on {live.device.replace("threads", "cores").replace("thread", "core")}</b>, so each request
+        gets a few tokens per second and bursts queue up. On an NVIDIA L4 GPU the same engine serves{" "}
+        <b>1,357 tokens/s</b> (<a href={`${REPO}#against-vllm-on-an-nvidia-gpu`}>benchmarks</a>).
+        {SAME_ORIGIN && " Everyone with this page open shares this engine."}
+      </div>
+    ) : SAME_ORIGIN && live.device ? (
+      <p className="hint" style={{ marginTop: -6, marginBottom: 12, color: "var(--text-secondary)" }}>
+        Running on {live.device}. Everyone with this page open watches the same engine.
+      </p>
+    ) : null)}
+    {live.status === "open" && <AskBox server={server} model={live.servedModel} connected onRequest={onRequest} />}
     </>
   );
 }

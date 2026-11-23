@@ -7,9 +7,18 @@ const GAP = 3;
 const LEFT = 64;
 const MAX_ROWS = 40;
 
-/** One row per request on a moving time window: queued (gray), running (blue), preempted (orange). */
-export function RequestLanes({ model, theme, maxWindowSec = 30, version }: {
-  model: EngineModel; theme: Theme; maxWindowSec?: number; version: number;
+/** Short row label: "you" for the visitor's own request, "chat"/"api" for other API requests. */
+function label(id: string, highlight: string) {
+  if (id === highlight) return "you";
+  if (id.startsWith("chatcmpl-")) return "chat";
+  if (id.startsWith("cmpl-")) return "api";
+  return id.replace(/^req-|^api-/, "#");
+}
+
+/** One row per request on a moving time window: queued (gray), running (blue), preempted (orange).
+ *  The highlighted request (the visitor's own prompt) is always shown and marked. */
+export function RequestLanes({ model, theme, maxWindowSec = 30, version, highlight = "" }: {
+  model: EngineModel; theme: Theme; maxWindowSec?: number; version: number; highlight?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<{ r: ReqState; x: number; y: number } | null>(null);
@@ -34,10 +43,15 @@ export function RequestLanes({ model, theme, maxWindowSec = 30, version }: {
     pick.push(...queued.slice(0, Math.max(0, Math.min(8, MAX_ROWS - pick.length))));
     pick.push(...done.slice(-Math.max(0, MAX_ROWS - pick.length)));
     pick.push(...queued.slice(8, 8 + Math.max(0, MAX_ROWS - pick.length)));
+    const mine = model.requests.get(highlight);
+    if (mine && !pick.includes(mine) && (mine.finished === null || mine.finished >= t0)) {
+      if (pick.length >= MAX_ROWS) pick.pop();
+      pick.push(mine);
+    }
     const arrival = new Map(model.order.map((id, i) => [id, i]));
     return pick.sort((a, b) => arrival.get(a.id)! - arrival.get(b.id)!);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [version, t0]);
+  }, [version, t0, highlight]);
 
   if (!rows.length) return <div className="empty">No requests yet.</div>;
 
@@ -66,9 +80,12 @@ export function RequestLanes({ model, theme, maxWindowSec = 30, version }: {
                  const box = ref.current!.getBoundingClientRect();
                  setHover({ r, x: ev.clientX - box.left, y: ev.clientY - box.top });
                }}>
-              <rect x={0} y={y - 1} width={width} height={ROW + 2} fill="transparent" />
-              <text x={LEFT - 8} y={y + ROW - 2} fontSize={9.5} fill={theme["text-muted"]} textAnchor="end">
-                {r.id.replace(/^req-|^api-/, "#")}
+              <rect x={0} y={y - 1.5} width={width} height={ROW + 3} rx={3}
+                    fill={r.id === highlight ? theme["series-1"] : "transparent"} fillOpacity={0.14} />
+              <text x={LEFT - 8} y={y + ROW - 2} fontSize={9.5} textAnchor="end"
+                    fill={r.id === highlight ? theme["text-primary"] : theme["text-muted"]}
+                    fontWeight={r.id === highlight ? 700 : 400}>
+                {label(r.id, highlight)}
               </text>
               {r.segments.map((s, j) => {
                 const end = s.end ?? now;

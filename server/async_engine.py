@@ -72,14 +72,16 @@ class AsyncEngine:
 
     # ------------------------------------------------------------------ asyncio side
 
-    async def generate(self, prompt_ids: list[int], params: SamplingParams) -> AsyncIterator[StepOutput]:
+    async def generate(self, prompt_ids: list[int], params: SamplingParams,
+                       request_id: str | None = None) -> AsyncIterator[StepOutput]:
         """Submit a request and yield its tokens as they're produced. Closing the generator
-        early (client disconnected, stop string hit) aborts the request in the engine."""
+        early (client disconnected, stop string hit) aborts the request in the engine.
+        request_id names the request in engine events (the API passes its response id)."""
         if self.error is not None:
             raise RuntimeError(f"engine thread crashed: {self.error!r}")
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
-        rid = f"api-{next(self._ids)}"
+        rid = request_id or f"api-{next(self._ids)}"
         self._commands.put(("add", rid, prompt_ids, params, loop, q))
         finished = False
         try:

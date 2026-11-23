@@ -74,6 +74,21 @@ def test_idle_event_stream_is_closed(our_model, tokenizer):
         assert closed.value.reason == "idle"
 
 
+def test_response_id_names_the_request_in_engine_events(our_model, tokenizer):
+    """The dashboard finds a visitor's own request in the event stream by the response id."""
+    engine = LLMEngine(our_model, max_num_seqs=2, max_model_len=256, max_num_batched_tokens=512,
+                       kv_cache="paged", num_kv_blocks=32)
+    app = create_app(AsyncEngine(engine), tokenizer, MODEL)
+    with TestClient(app) as http, http.websocket_connect("/v1/events") as ws:
+        ws.receive_json()  # hello
+        body = {"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 2}
+        rid = http.post("/v1/chat/completions", json=body).json()["id"]
+        event = ws.receive_json()
+        while event["type"] != "request_arrived":
+            event = ws.receive_json()
+        assert rid.startswith("chatcmpl-") and event["id"] == rid
+
+
 def test_health_and_models(http, client):
     assert http.get("/health").json() == {"status": "ok"}
     assert [m.id for m in client.models.list().data] == [MODEL]

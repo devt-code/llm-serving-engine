@@ -18,7 +18,7 @@ engine sleeps while nobody is using it, so its first load can take up to a minut
 - **Median time to first token drops from 7.2 s to 29 ms** at 6 requests per second when requests share a
   system prompt, thanks to prefix caching (96% of prompt tokens reused).
 - **Outputs identical to Hugging Face** token for token (fp32 greedy, 20 prompts), and identical
-  whether a request runs alone, in a batch, or gets preempted and recomputed: 109 tests.
+  whether a request runs alone, in a batch, or gets preempted and recomputed: 110 tests.
 
 Every number here is measured and reproducible with the scripts in [`bench/`](bench/). Raw results are in
 [`bench/results/`](bench/results/).
@@ -196,7 +196,9 @@ cd dashboard && npm install && npx vite      # http://localhost:5173
 ```
 
 Click **Send 50 requests** or drag the arrival-rate slider, and watch requests join the batch,
-blocks fill up, prefix blocks get shared, and requests get preempted when memory runs out.
+blocks fill up, prefix blocks get shared, and requests get preempted when memory runs out. Or
+type a prompt under **Ask the model**: the reply streams in while your request runs in the same
+batch, marked *you* in the request timeline.
 
 **Use it as a library:**
 
@@ -238,7 +240,7 @@ shut down.
 pytest
 ```
 
-109 tests (about 3 minutes on a laptop). They:
+110 tests (about 3 minutes on a laptop). They:
 
 - compare every model component with Hugging Face, using the real weights;
 - check greedy generation on 20 prompts;

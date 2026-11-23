@@ -1,17 +1,18 @@
 # Upstream contribution plan
 
-Updated 2026-11-22. A Transformers fix is open as
+Updated 2026-11-23. A Transformers fix was merged on 2026-11-23 as
 [huggingface/transformers#51099](https://github.com/huggingface/transformers/pull/51099): a bug
 this project ran into on Colab, which nobody had reported. Every issue-tracker candidate checked
-earlier now has someone else's PR.
+earlier already had someone else's PR.
 
-## Opened: Transformers
+## Merged: Transformers
 
 A broken torchaudio made every model import fail, even text-only ones, because `audio_utils.py`
 imported torchaudio at module scope. The fix imports it lazily, the same way the maintainers fixed
 `loss_rnnt.py` in July. Branch `fix-lazy-torchaudio-import` on `devt-code/transformers`; local
-clone in `~/Documents/Projects/transformers`. Checks and the PR text:
-[upstream-transformers-pr.md](upstream-transformers-pr.md).
+clone in `~/Documents/Projects/transformers`. An audio maintainer pushed a small cleanup commit,
+approved it, and it merged about 17 hours after it was opened. Checks, the PR text and how the
+review went: [upstream-transformers-pr.md](upstream-transformers-pr.md).
 
 Transformers accepts a standalone PR for a bug nobody has reported, if it includes a script that
 fails on `main` and passes with the fix. No need to ask first; the first PR gets priority.
@@ -38,3 +39,5 @@ with a reproducer, are the reliable way in.
 3. Keep the diff minimal, reuse an approach the codebase already has, and link to it.
 4. Run the repo's own checks (`make fix-repo` in Transformers) and the tests for the files you
    changed, and wait for CI to pass before tagging reviewers.
+5. On a first PR, expect the full CI to wait for a maintainer's approval. In Transformers a triage
+   maintainer routes new PRs to the right reviewers, so tagging people yourself may not be needed.

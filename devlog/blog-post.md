@@ -148,7 +148,9 @@ few steps and are preempted again, which I would never have noticed in the numbe
 
 - CUDA graphs for decode steps, to cut the per-step launch overhead.
 - Chunked prefill, so new requests stop pausing everyone else's decoding.
-- An upstream contribution in the vLLM ecosystem; the candidates are in the repo's dev log.
+- More upstream contributions to the inference stack. The first one is merged: a fix in Hugging
+  Face Transformers ([#51099](https://github.com/huggingface/transformers/pull/51099)) for a bug I
+  hit while benchmarking on Colab, where a broken torchaudio install made every model import fail.
 
 If you want to read the code, start with `engine/scheduler.py` and `engine/kv_cache.py`. The dev logs
 in the repo have every measurement and every wrong turn.

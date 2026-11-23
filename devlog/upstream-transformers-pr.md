@@ -2,11 +2,20 @@
 
 Opened as [huggingface/transformers#51099](https://github.com/huggingface/transformers/pull/51099)
 on 2026-11-22, from branch `fix-lazy-torchaudio-import` of `devt-code/transformers` (commit
-`533b01c`, on top of `main` at `be48e7a`), with a regression test.
+`533b01c`, on top of `main` at `be48e7a`), with a regression test. **Merged on 2026-11-23**
+(merge commit `d1fc2bc`), about 17 hours after it was opened.
 
-Next: once CI is green, add a comment tagging vasqu and ydshieh, who reviewed #47422. The PR
-description names them without tagging, because the contributing guide asks for green CI before
-pinging anyone.
+## How the review went
+
+- A bot held back the full CI: it runs on its own only for authors who already have a merged PR
+  in the repo, so a maintainer had to approve it.
+- About 12 hours in, Rocketknight1 triaged it and passed it to the audio maintainers (eustlb,
+  ebezzam).
+- eustlb pushed a small "nits" commit to the branch (a comment that says why torchaudio loads
+  lazily instead of pointing at #47422, and `@require_torch` on the new test), approved the PR and
+  turned on auto-merge.
+- CI passed and it merged on its own. The earlier plan, tagging vasqu and ydshieh once CI was
+  green, wasn't needed.
 
 ## The bug, in plain words
 

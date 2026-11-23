@@ -12,6 +12,9 @@ const EXAMPLES = [
 
 type State = "idle" | "waiting" | "streaming" | "done" | "error";
 
+/** A reply that ended before the model finished (token limit, or the visitor pressed Stop). */
+const cutOff = (text: string) => text.trimEnd() + "…";
+
 /** A prompt box that streams a reply from /v1/chat/completions. The request runs in the same engine
  *  as everyone else's, and onRequest reports its id so the request timeline can mark it. */
 export function AskBox({ server, model, connected, onRequest }: {
@@ -85,10 +88,12 @@ export function AskBox({ server, model, connected, onRequest }: {
           }
         }
       }
+      if (finish === "length") setReply(cutOff(text));
       setStats(summary() + (finish === "length" ? ` · stopped at ${MAX_TOKENS} tokens` : ""));
       setState("done");
     } catch (e) {
       if (ctl.signal.aborted) {
+        if (text) setReply(cutOff(text));
         setStats(text ? `${summary()} · stopped` : "");
         setState(text ? "done" : "idle");
         return;

@@ -5,7 +5,9 @@ to many users at once. It runs Qwen3-0.6B with continuous batching, a paged KV c
 preemption, and prefix caching, behind an OpenAI-compatible streaming API. A live dashboard shows
 what the engine is doing.
 
-**[▶ Watch a recorded run in the dashboard](https://devt-code.github.io/llm-serving-engine/)**, no GPU needed.
+**[▶ Try the live engine](https://devt-code--llm-serving-engine.us-east.modal.run)** on a cloud CPU, or
+**[watch a recorded run](https://devt-code.github.io/llm-serving-engine/)** in the dashboard. The live
+engine sleeps while nobody is using it, so its first load can take up to a minute.
 
 - **3.2× the throughput of Hugging Face `generate()`** on an Apple M3 Pro, same model and
   workload (558 vs 176 tok/s), and **median time to first token cut from 80 s to 2.9 s** under
@@ -16,7 +18,7 @@ what the engine is doing.
 - **Median time to first token drops from 7.2 s to 29 ms** at 6 requests per second when requests share a
   system prompt, thanks to prefix caching (96% of prompt tokens reused).
 - **Outputs identical to Hugging Face** token for token (fp32 greedy, 20 prompts), and identical
-  whether a request runs alone, in a batch, or gets preempted and recomputed: 107 tests.
+  whether a request runs alone, in a batch, or gets preempted and recomputed: 109 tests.
 
 Every number here is measured and reproducible with the scripts in [`bench/`](bench/). Raw results are in
 [`bench/results/`](bench/results/).
@@ -207,13 +209,36 @@ engine = LLMEngine(load_model(), kv_cache_gb=2.0)
 outputs = engine.generate([[9707, 11, 1879]], SamplingParams(max_new_tokens=32))
 ```
 
+## Deploy it
+
+The [`Dockerfile`](Dockerfile) packs the server, the model and the dashboard into one CPU image
+that runs on any Docker host:
+
+```bash
+docker build -t llm-serving-engine . && docker run --rm -p 7860:7860 llm-serving-engine   # http://localhost:7860
+```
+
+The live demo runs the same server on [Modal](https://modal.com) ([`deploy/modal/app.py`](deploy/modal/app.py)),
+which starts it on the first request and stops it a minute after the last. Without a payment
+method on file, Modal's free plan includes $1 of compute a month (about 7 hours of serving on
+CPU) and stops the app once that is used up, so it can't charge anything:
+
+```bash
+pip install modal && modal token new
+deploy/modal/deploy.sh      # builds the dashboard, deploys, prints the URL
+```
+
+On a public server, `--max-tokens-cap`, `--max-waiting` and `--demo-max-count` keep one visitor
+from tying up the machine, and `--ws-idle-timeout` disconnects idle dashboards so the server can
+shut down.
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-107 tests (about 3 minutes on a laptop). They:
+109 tests (about 3 minutes on a laptop). They:
 
 - compare every model component with Hugging Face, using the real weights;
 - check greedy generation on 20 prompts;
@@ -248,6 +273,7 @@ engine/      model.py (Qwen3), scheduler.py, kv_cache.py (paged + prefix cache),
              engine.py (step loop), sampler.py, events.py (event stream), loader.py
 server/      api.py (FastAPI, OpenAI-compatible), async_engine.py (engine thread)
 dashboard/   React + TypeScript + Vite + Recharts; replay traces in public/traces/
+deploy/      the Modal app behind the live demo (the Dockerfile is at the root)
 bench/       benchmarks and results/
 tests/       pytest suite
 notebooks/   NVIDIA GPU checks and the vLLM comparison

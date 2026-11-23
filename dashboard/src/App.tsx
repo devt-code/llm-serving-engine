@@ -9,11 +9,15 @@ import { useTheme } from "./theme";
 
 type Mode = "replay" | "live";
 const REPO = "https://github.com/devt-code/llm-serving-engine";
+const LIVE_DEMO = "https://devt-code--llm-serving-engine.us-east.modal.run"; // deploy/modal/app.py
+// Set when the engine serves this dashboard itself (the Docker image and the live demo): Live mode
+// then talks to the same server and opens first.
+const SAME_ORIGIN = import.meta.env.VITE_SAME_ORIGIN === "1";
 
 export default function App() {
   const params = new URLSearchParams(location.search);
-  const [mode, setMode] = useState<Mode>(params.has("live") ? "live" : "replay");
-  const [server, setServer] = useState(params.get("server") ?? "http://localhost:8000");
+  const [mode, setMode] = useState<Mode>(params.has("live") || SAME_ORIGIN ? "live" : "replay");
+  const [server, setServer] = useState(params.get("server") ?? (SAME_ORIGIN ? location.origin : "http://localhost:8000"));
   const theme = useTheme();
   const live = useLive(server, mode === "live");
   const replay = useReplay();
@@ -84,7 +88,7 @@ function Panels({ model, version, theme }: { model: EngineModel; version: number
         </section>
         <section className="card">
           <h2>KV cache blocks</h2>
-          <p className="hint">Each square is a {model.blockSize}-token block of GPU memory, handed out as requests grow.</p>
+          <p className="hint">Each square is a {model.blockSize}-token block of KV cache memory, handed out as requests grow.</p>
           <BlockMap model={model} theme={theme} version={version} />
         </section>
       </div>
@@ -155,6 +159,30 @@ function LiveControls({ server, setServer, live }: {
   const [maxTokens, setMaxTokens] = useState(96);
   const [shared, setShared] = useState(true);
   load.opts.current = { maxTokens, sharedPrefix: shared };
+  // Generated load stops when the connection drops. On a public server it also stops when the page
+  // is hidden and after 3 minutes, so a forgotten tab can't keep the server busy (and paid for).
+  const [stopped, setStopped] = useState("");
+  const { rate, setRate } = load;
+  useEffect(() => {
+    if (rate <= 0) return;
+    if (live.status !== "open") {
+      setRate(0);
+      return;
+    }
+    if (!SAME_ORIGIN) return;
+    setStopped("");
+    const stop = (why: string) => {
+      setRate(0);
+      setStopped(why);
+    };
+    const onVisibility = () => document.hidden && stop("stopped while the page was hidden");
+    document.addEventListener("visibilitychange", onVisibility);
+    const timer = window.setTimeout(() => stop("stopped after 3 minutes"), 3 * 60_000);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      clearTimeout(timer);
+    };
+  }, [rate, setRate, live.status]);
   const statusClass = live.status === "open" ? "ok" : live.status === "error" || live.status === "closed" ? "bad" : "";
   const statusText = {
     idle: "Not connected", connecting: "Connecting…", open: `Connected${live.servedModel ? ` · ${live.servedModel}` : ""}`,
@@ -162,23 +190,27 @@ function LiveControls({ server, setServer, live }: {
   }[live.status];
   // A page served from the public internet can't open connections to localhost (browsers block
   // public sites from reaching the local network). Live mode needs the dashboard served locally.
-  const hosted = !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+  const hosted = !SAME_ORIGIN && !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
   const failed = live.status === "error" || live.status === "closed";
   return (
     <>
     {hosted && live.status !== "open" && (
       <div className="card notice">
-        <h2>Live mode runs on your own computer</h2>
+        <h2>Watch the engine live</h2>
         <p>
-          This page is hosted on the web, and browsers don't let a website connect to programs on your machine. To watch
-          the engine live, run the engine and this dashboard locally (Python 3.11 and Node 18+, about 4 GB):
+          <a href={LIVE_DEMO}><b>Open the live demo</b></a>: the same dashboard, connected to the engine running on a cloud
+          CPU. It sleeps while nobody is using it, so the first load can take up to a minute.
+        </p>
+        <p>
+          Or run it on your own computer. Browsers don't let a website connect to programs on your machine, so run this
+          dashboard locally too (Python 3.11 and Node 18+, about 4 GB):
         </p>
         <pre>{`git clone ${REPO}.git && cd llm-serving-engine
 python3.11 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-0.6B', local_dir='models/qwen3-0.6b')"
 python -m server.api                      # terminal 1
 cd dashboard && npm install && npx vite   # terminal 2`}</pre>
-        <p>Then open <a href="http://localhost:5173/?live">http://localhost:5173/?live</a>. Or switch to <b>Replay a recorded run</b> above: it shows a real recorded run, no setup needed.</p>
+        <p>Then open <a href="http://localhost:5173/?live">http://localhost:5173/?live</a>.</p>
       </div>
     )}
     <div className="controls" style={hosted && failed ? { opacity: 0.55 } : undefined}>
@@ -199,9 +231,18 @@ cd dashboard && npm install && npx vite   # terminal 2`}</pre>
       </label>
       <label><input type="checkbox" checked={shared} onChange={(e) => setShared(e.target.checked)} /> Shared system prompt</label>
       <span className="mono" style={{ color: "var(--text-muted)", fontSize: 12 }}>
-        {load.sent} sent{load.errors ? ` · ${load.errors} errors` : ""}
+        {load.sent} sent{load.errors ? ` · ${load.errors} errors` : ""}{stopped && rate === 0 ? ` · load ${stopped}` : ""}
       </span>
     </div>
+    {SAME_ORIGIN && (
+      <p className="hint" style={{ marginTop: -6, marginBottom: 12, color: "var(--text-secondary)" }}>
+        {live.status === "closed" && live.closeReason === "idle"
+          ? "Disconnected after a couple of quiet minutes, so the server can shut down while nobody is using it. Reload the page to reconnect."
+          : `Running on ${live.device || "a shared server"}${/CPU/.test(live.device)
+              ? ", so each request gets a few tokens per second; on a GPU the same engine is far faster" : ""}. `
+            + "Everyone with this page open watches the same engine."}
+      </p>
+    )}
     </>
   );
 }

@@ -10,20 +10,27 @@ export function useLive(baseUrl: string, enabled: boolean) {
   const [version, setVersion] = useState(0);
   const [status, setStatus] = useState<LiveStatus>("idle");
   const [model, setModel] = useState("");
+  const [device, setDevice] = useState("");
+  const [closeReason, setCloseReason] = useState("");
 
   useEffect(() => {
     if (!enabled) return;
     modelRef.current = new EngineModel();
     setStatus("connecting");
+    setCloseReason("");
     const ws = new WebSocket(baseUrl.replace(/^http/, "ws").replace(/\/$/, "") + "/v1/events");
     let dirty = false;
     ws.onopen = () => setStatus("open");
     ws.onerror = () => setStatus("error");
-    ws.onclose = () => setStatus((s) => (s === "error" ? s : "closed"));
+    ws.onclose = (ev) => {
+      setCloseReason(ev.reason); // "idle": the server dropped an idle viewer so it can shut down
+      setStatus((s) => (s === "error" ? s : "closed"));
+    };
     ws.onmessage = (msg) => {
       const e = JSON.parse(msg.data) as EngineEvent;
       if (e.type === "hello") {
         setModel(e.model);
+        setDevice(e.device ?? "");
         const m = modelRef.current;
         // Joined mid-run: size the block map from the server's current stats.
         if (!m.numBlocks && e.stats?.kv_total) m.apply({ t: 0, type: "engine_started", kv_total: e.stats.kv_total });
@@ -50,7 +57,7 @@ export function useLive(baseUrl: string, enabled: boolean) {
     };
   }, [baseUrl, enabled]);
 
-  return { model: modelRef.current, version, status, servedModel: model };
+  return { model: modelRef.current, version, status, servedModel: model, device, closeReason };
 }
 
 export type LoadOptions = { maxTokens: number; sharedPrefix: boolean };

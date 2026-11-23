@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+models
+bench
+tests
+notebooks
+devlog
+docs
+deploy
+**/__pycache__
+**/*.pyc
+.pytest_cache
+dashboard/node_modules
+dashboard/dist
+dashboard/dist-server

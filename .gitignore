@@ -12,3 +12,4 @@ bench/traces/*.jsonl
 CLAUDE.md
 CLAUDE.local.md
 .claude/
+dashboard/dist-server/

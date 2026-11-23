@@ -2,6 +2,10 @@
 
     python -m server.api                       # serves models/qwen3-0.6b on http://localhost:8000
     python -m server.api --port 8080 --kv-cache-gb 4 --trace bench/traces/server.jsonl
+    python -m server.api --dashboard dashboard/dist   # also serve the built dashboard at /
+
+For a public deployment, the --max-tokens-cap, --max-waiting and --demo-max-count options keep one
+visitor from tying up the machine (see the Dockerfile).
 
 Endpoints
     GET  /health
@@ -22,6 +26,7 @@ import argparse
 import asyncio
 import itertools
 import json
+import os
 import random
 import time
 import uuid
@@ -173,7 +178,15 @@ def _sse(obj: dict | str) -> str:
 # ---------------------------------------------------------------------------- app
 
 
-def create_app(async_engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI:
+def create_app(async_engine: AsyncEngine, tokenizer, model_name: str, *, max_tokens_cap: int | None = None,
+               max_waiting: int | None = None, demo_max_count: int = 500, dashboard_dir: str | None = None,
+               ws_idle_timeout: float | None = None, device_label: str = "") -> FastAPI:
+    """max_tokens_cap: largest output a request may ask for. max_waiting: answer 429 once this many
+    requests are waiting. demo_max_count: most requests one /v1/demo/load call starts. dashboard_dir:
+    serve the built dashboard at / (the API routes still win). ws_idle_timeout: close a dashboard's
+    event stream after this many seconds without engine activity, so a host that bills while
+    connections are open can shut down. device_label: shown to dashboard viewers, e.g. "NVIDIA L4 GPU"."""
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if not async_engine._thread.is_alive():
@@ -191,6 +204,10 @@ def create_app(async_engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI
         room = async_engine.max_request_len - prompt_len
         if room < 1:
             return openai_error(400, f"prompt is {prompt_len} tokens; the limit is {async_engine.max_request_len - 1}")
+        if max_tokens_cap is not None and max_tokens_cap < room:
+            room = max_tokens_cap
+            if max_tokens is not None and max_tokens > room:
+                return openai_error(400, f"max_tokens must be between 1 and {room} on this server")
         if max_tokens is None:
             max_tokens = room
         if max_tokens < 1 or max_tokens > room:
@@ -201,6 +218,14 @@ def create_app(async_engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI
             max_new_tokens=max_tokens, temperature=max(0.0, body.temperature), top_p=body.top_p,
             seed=body.seed, ignore_eos=getattr(body, "ignore_eos", False), stop_token_ids=tuple(stop_ids),
         )
+
+    def num_waiting() -> int:
+        return len(async_engine.engine.scheduler.waiting)
+
+    def busy() -> JSONResponse | None:
+        if max_waiting is not None and num_waiting() >= max_waiting:
+            return openai_error(429, "the server is busy, try again in a few seconds", "rate_limit_error")
+        return None
 
     # ------------------------------------------------------------ basic
 
@@ -225,6 +250,8 @@ def create_app(async_engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI
 
     @app.post("/v1/completions")
     async def completions(body: CompletionRequest, request: Request):
+        if (refused := busy()) is not None:
+            return refused
         prompt_ids = body.prompt if isinstance(body.prompt, list) else tokenizer(body.prompt)["input_ids"]
         if not prompt_ids:
             return openai_error(400, "prompt is empty")
@@ -264,7 +291,9 @@ def create_app(async_engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI
 
     @app.post("/v1/chat/completions")
     async def chat(body: ChatCompletionRequest, request: Request):
-        messages = [{"role": m.role, "content": _message_text(m.content)} for m in body.messages]
+        if (refused := busy()) is not None:
+            return refused
+        messages =[{"role": m.role, "content": _message_text(m.content)} for m in body.messages]
         kwargs = {"enable_thinking": False, **body.chat_template_kwargs}  # Qwen3: no <think> by default
         try:
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **kwargs)
@@ -320,11 +349,14 @@ def create_app(async_engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI
 
     @app.post("/v1/demo/load")
     async def demo_load(body: DemoLoadRequest):
-        n = max(0, min(body.count, 500))
+        n = max(0, min(body.count, demo_max_count))
+        if max_waiting is not None:
+            n = min(n, max(0, max_waiting - num_waiting()))
+        longest = min(body.max_tokens, max_tokens_cap or body.max_tokens)
         for _ in range(n):
             q = DEMO_QUESTIONS[next(demo_counter) % len(DEMO_QUESTIONS)]
             prompt = (DEMO_SYSTEM if body.shared_prefix else "") + q + "\nAnswer:"
-            max_tokens = max(8, round(body.max_tokens * random.uniform(0.4, 1.0)))
+            max_tokens = max(8, round(longest * random.uniform(0.4, 1.0)))
             params = SamplingParams(max_new_tokens=min(max_tokens, async_engine.max_request_len - 256),
                                     temperature=body.temperature, top_p=0.95)
             task = asyncio.create_task(_demo_one(prompt, params))
@@ -348,14 +380,37 @@ def create_app(async_engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI
 
         async_engine.engine.events.subscribe(push)
         try:
-            await ws.send_json({"type": "hello", "stats": async_engine.stats(), "model": model_name})
+            await ws.send_json({"type": "hello", "stats": async_engine.stats(), "model": model_name,
+                                "device": device_label})
             while True:
-                await ws.send_json(await q.get())
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=ws_idle_timeout)
+                except asyncio.TimeoutError:
+                    await ws.close(code=1000, reason="idle")
+                    break
+                await ws.send_json(event)
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
             async_engine.engine.events.unsubscribe(push)
 
+    if dashboard_dir:
+        from fastapi.staticfiles import StaticFiles
+
+        class DashboardFiles(StaticFiles):
+            """Files under assets/ have content hashes in their names, so browsers may keep them for
+            good. Every other file is fetched again on each visit: some hosts (Modal) give all files a
+            1970 modification time, which browsers would treat as fresh for years, and which gives a
+            changed file of the same size the same ETag."""
+
+            async def get_response(self, path, scope):
+                response = await super().get_response(path, scope)  # raises for a missing file
+                hashed = path.startswith("assets/")
+                response.headers["Cache-Control"] = "public, max-age=31536000, immutable" if hashed else "no-store"
+                return response
+
+        # Mounted last, so /health and /v1/* keep matching their routes first.
+        app.mount("/", DashboardFiles(directory=dashboard_dir, html=True), name="dashboard")
     return app
 
 
@@ -389,15 +444,16 @@ async def _collect(gen, detok: Detokenizer, request: Request) -> tuple[str, str 
 # ---------------------------------------------------------------------------- CLI
 
 
-def main():
-    import torch
-    import uvicorn
-    from transformers import AutoTokenizer
+def container_cpus() -> int | None:
+    """CPUs a container may use (cgroup v2 cpu.max), or None when there's no CPU limit."""
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+        return None if quota == "max" else max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        return None
 
-    from engine.engine import LLMEngine
-    from engine.events import EventLog
-    from engine.loader import load_model, pick_device
 
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="OpenAI-compatible server for the LLM serving engine")
     ap.add_argument("--model", default="models/qwen3-0.6b")
     ap.add_argument("--served-model-name", default=None, help="model id clients use (default: folder name)")
@@ -412,9 +468,32 @@ def main():
     ap.add_argument("--max-num-batched-tokens", type=int, default=4096)
     ap.add_argument("--no-prefix-caching", action="store_true")
     ap.add_argument("--trace", default=None, help="also write all engine events to this JSONL file")
-    args = ap.parse_args()
+    ap.add_argument("--dashboard", default=None, help="serve the built dashboard (dashboard/dist) at /")
+    ap.add_argument("--max-tokens-cap", type=int, default=None, help="largest max_tokens a request may ask for")
+    ap.add_argument("--max-waiting", type=int, default=None, help="answer 429 when this many requests are waiting")
+    ap.add_argument("--demo-max-count", type=int, default=500, help="most requests one /v1/demo/load call starts")
+    ap.add_argument("--ws-idle-timeout", type=float, default=None,
+                    help="close dashboard event streams after this many seconds without engine activity")
+    return ap
+
+
+def build_app(args: argparse.Namespace) -> FastAPI:
+    """Load the model and build the app from parsed arguments (used by main() and deploy/modal)."""
+    import torch
+    from transformers import AutoTokenizer
+
+    from engine.engine import LLMEngine
+    from engine.events import EventLog
+    from engine.loader import load_model, pick_device
 
     device = pick_device(args.device)
+    if device.type == "cpu" and "OMP_NUM_THREADS" not in os.environ:
+        # In a CPU-limited container, PyTorch still sees every core of the host and starts a thread
+        # per core; those threads fight over the quota (2.4x slower measured with 2 of 11 CPUs).
+        cpus = container_cpus()
+        if cpus and cpus < torch.get_num_threads():
+            torch.set_num_threads(cpus)
+            print(f"using {cpus} CPU threads (container limit)")
     print(f"loading {args.model} on {device} ({args.dtype}) ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = load_model(args.model, device=device, dtype=getattr(torch, args.dtype))
@@ -426,8 +505,24 @@ def main():
     )
     name = args.served_model_name or Path(args.model).name
     print(f"KV cache: {engine.cache.num_blocks} blocks x {args.block_size} tokens "
-          f"({engine.cache.nbytes / 1e9:.2f} GB), serving as {name!r} on http://{args.host}:{args.port}/v1")
-    uvicorn.run(create_app(AsyncEngine(engine), tokenizer, name), host=args.host, port=args.port, log_level="info")
+          f"({engine.cache.nbytes / 1e9:.2f} GB), serving as {name!r} on http://{args.host}:{args.port}/v1"
+          + (f", dashboard at http://{args.host}:{args.port}/" if args.dashboard else ""))
+    if device.type == "cuda":
+        device_label = f"{torch.cuda.get_device_name(device)} GPU"
+    elif device.type == "mps":
+        device_label = "Apple GPU (MPS)"
+    else:
+        device_label = f"{torch.get_num_threads()} CPU threads"
+    return create_app(AsyncEngine(engine), tokenizer, name, max_tokens_cap=args.max_tokens_cap,
+                      max_waiting=args.max_waiting, demo_max_count=args.demo_max_count, dashboard_dir=args.dashboard,
+                      ws_idle_timeout=args.ws_idle_timeout, device_label=device_label)
+
+
+def main():
+    import uvicorn
+
+    args = build_parser().parse_args()
+    uvicorn.run(build_app(args), host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

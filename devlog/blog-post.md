@@ -9,7 +9,8 @@ serving engine from scratch in PyTorch, ran a real model on it (Qwen3-0.6B), and
 step.
 
 **Code:** https://github.com/devt-code/llm-serving-engine ·
-**Live demo:** https://devt-code.github.io/llm-serving-engine/
+**Live demo:** https://devt-code--llm-serving-engine.us-east.modal.run ·
+**Recorded runs:** https://devt-code.github.io/llm-serving-engine/
 
 ## The problem in one paragraph
 
@@ -138,7 +139,9 @@ starting vLLM's engine process with spawn, because forking it after CUDA had sta
 The engine emits an event for every step, request, block allocation, preemption and prefix hit. A
 small React app rebuilds the engine's state from that stream: a request timeline, a map of every KV
 block, and live charts. It works live against the server, or replays recorded runs in the browser,
-with no GPU. The memory-pressure recording shows preemption *thrashing*: some requests are readmitted, run a
+with no GPU. The public live demo runs on a small cloud CPU that starts on the first request and
+shuts down a minute after the last viewer leaves, which keeps it within a free tier. The
+memory-pressure recording shows preemption *thrashing*: some requests are readmitted, run a
 few steps and are preempted again, which I would never have noticed in the numbers alone.
 
 ## What's next

@@ -39,11 +39,15 @@ A few things I found:
 - On the L4, paging alone was a clear win instead (762 → 941 tok/s): running 94 requests instead of
   32 outweighs the gather cost there.
 - Shared system prompt at 6 req/s: median TTFT **7.2 s → 29 ms** with prefix caching.
-- In bf16, batching changes a few outputs (near-ties flip); in fp32 they're identical. 107 tests
+- In bf16, batching changes a few outputs (near-ties flip); in fp32 they're identical. 110 tests
   check outputs against HF and across batching and preemption.
 
-There's a dashboard that replays recorded runs in the browser (request timeline, KV block map, live
-charts): https://devt-code.github.io/llm-serving-engine/
+There's a dashboard (request timeline, KV block map, live charts). You can drive the live engine
+yourself (ask it something and watch your request join the batch), or replay runs recorded on my
+laptop's GPU:
+- Live: https://devt-code--llm-serving-engine.us-east.modal.run (a small free cloud CPU, so a few
+  tokens per second per request; it sleeps when idle, so the first load can take up to a minute)
+- Recorded runs: https://devt-code.github.io/llm-serving-engine/
 
 Code and full write-ups: https://github.com/devt-code/llm-serving-engine
 
@@ -72,8 +76,10 @@ Profiling traced it to a single indexing call that was 4× slower than an equiva
 GPUs; changing one line doubled throughput.
 
 It ships with an OpenAI-compatible API and a dashboard that shows every request and every block of
-GPU memory as the engine works. You can watch a recorded run in your browser:
-https://devt-code.github.io/llm-serving-engine/
+memory as the engine works. Try it live: ask it a question and watch your request join the batch
+(it runs on a small free cloud server, so give it up to a minute to wake up):
+https://devt-code--llm-serving-engine.us-east.modal.run
+Or watch a recorded run: https://devt-code.github.io/llm-serving-engine/
 
 Code and write-ups: https://github.com/devt-code/llm-serving-engine
 
@@ -88,7 +94,8 @@ Code and write-ups: https://github.com/devt-code/llm-serving-engine
   on the same hardware, **2.6× more concurrent requests** in the same KV memory, **TTFT 7.2 s → 29 ms**
   with prefix caching.
 - Built a real-time React/TypeScript dashboard that visualizes batching and KV cache paging from the
-  engine's event stream, with a replay mode for GPU-free public demos.
+  engine's event stream, and deployed both as a public live demo on Modal that scales to zero and
+  stays within the free tier (request caps, idle shutdown).
 - Benchmarked against vLLM 0.34 on an NVIDIA L4: **5.4× Hugging Face's throughput and 23% of
   vLLM's at equal KV memory**, with the remaining gap (CUDA graphs, fused attention kernels, chunked
   prefill) documented.
